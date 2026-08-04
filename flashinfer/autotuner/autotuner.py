@@ -46,6 +46,36 @@ from flashinfer.autotuner.initializers import (
 _nvfp4_cutlass_version = "0.1"
 
 
+def _reject_v1_only_args(cache) -> None:
+    """Arguments the legacy implementation alone defines."""
+    if cache is not None:
+        raise ValueError(
+            "autotune(cache=<path>) is the legacy file cache and cannot be "
+            "combined with v2_opt_in=True. v2's managed store owns placement "
+            "itself -- pass cache_root=<dir> instead of a file path."
+        )
+
+
+def _reject_v2_only_args(cache_root, persistent_cache, measure) -> None:
+    """Arguments the v2 implementation alone defines."""
+    if measure is not None:
+        raise ValueError(
+            "autotune(measure=...) selects v2's measurement policy; pass "
+            "v2_opt_in=True to use it."
+        )
+    if cache_root is not None:
+        raise ValueError(
+            "autotune(cache_root=...) places v2's managed store; pass "
+            "v2_opt_in=True to use it."
+        )
+    if not persistent_cache:
+        raise ValueError(
+            "autotune(persistent_cache=False) controls whether v2 may touch "
+            "disk; pass v2_opt_in=True to use it. The legacy path is already "
+            "memory-only unless cache=<path> is given."
+        )
+
+
 def _tactic_to_json(tactic: Any) -> Any:
     """Convert a tactic value to a JSON-compatible format.
 
@@ -651,6 +681,11 @@ def autotune(
     tuning_buckets: tuple[int, ...] | None = None,
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
+    *,
+    v2_opt_in: bool = False,
+    persistent_cache: bool = True,
+    cache_root: str | os.PathLike | None = None,
+    measure: Any | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -719,8 +754,57 @@ def autotune(
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
             ``"fp8_gemm"``, ``"mxfp8_gemm"``.
 
+        v2_opt_in: Opt into the autotuner v2 implementation. ``False``
+            (default) selects the legacy path and is byte-identical to before
+            this parameter existed: persistence is the ``cache`` JSON file when
+            given, otherwise memory only. ``True`` selects v2 -- the
+            FlashInfer-managed store (:mod:`flashinfer.autotune_cache`), whose
+            per-entry atomic files under an environment-hashed directory are
+            safe for concurrent all-ranks tuning -- and is mutually exclusive
+            with ``cache``.
+
+            This is the single bifurcation point between the two
+            implementations. It is resolved here, on entry, and cannot change
+            for the life of the context, so the two can never interleave.
+
+            ``tune_mode`` keeps its meaning under either: ``True`` profiles
+            uncovered shapes and publishes winners, ``False`` replays
+            already-tuned winners without profiling.
+
+            **This parameter is transitional.** It exists so callers migrate
+            explicitly rather than by surprise, and it is scheduled for removal
+            once the frameworks have moved -- default flipped, then ignored,
+            then deleted (``docs/design_docs/autotuner_v2.md`` §5.1). Do not
+            build long-term configuration around it.
+
+        persistent_cache: Whether v2 may touch disk. ``True`` (default)
+            attaches the managed store for the remainder of the process, so
+            serving **after** this context exits keeps reusing tuned entries.
+            ``False`` keeps tuning in memory for this context even if a store
+            was attached earlier; that earlier attachment stays active for
+            serving outside the context. Requires ``v2_opt_in=True``.
+
+        cache_root: Root **directory** for the managed store (placement only --
+            schema and environment namespaces live below it, so no choice of
+            root can mix incompatible entries). Defaults to
+            ``FLASHINFER_AUTOTUNE_CACHE_DIR`` or
+            ``FLASHINFER_CACHE_DIR/autotune``. Requires ``v2_opt_in=True``.
+
+        measure: Optional
+            :class:`~flashinfer.autotune_cache.MeasurementPolicy` -- how tactics
+            are timed during profiling (eager vs CUDA-graph host-cost
+            semantics). Requires ``v2_opt_in=True`` -- it is a v2 concept, and
+            the legacy implementation has no measurement policy. Under
+            ``persistent_cache=True`` the policy is part of the store's
+            environment identity, so entries tuned under different policies
+            never overwrite each other.
+
     Raises:
-        ValueError: If ``tuning_buckets`` is provided but empty.
+        ValueError: If ``tuning_buckets`` is provided but empty, if ``cache``
+            is combined with ``v2_opt_in=True``, or if ``persistent_cache``,
+            ``cache_root`` or ``measure`` are given without ``v2_opt_in=True``.
+        RuntimeError: If a ``v2_opt_in=True`` context is nested inside another
+            one on the same thread.
 
     .. rubric:: Edge-case behaviour
 
@@ -784,6 +868,41 @@ def autotune(
             "tuning_buckets must contain at least one value when provided; "
             "pass None (or omit) to inherit the current buckets"
         )
+
+    # ---- Backend bifurcation -------------------------------------------
+    # Resolved once, here, before any state is touched.  Everything below
+    # branches on `v2_opt_in` only through this decision, so v1 and v2 cannot
+    # interleave within one context: the legacy file path runs iff v2_opt_in
+    # is False, and the managed store is consulted iff a _v2_local record is
+    # pushed.  Design doc: docs/design_docs/autotuner_v2.md §2.1.
+    # ---- The bifurcation ------------------------------------------------
+    # One decision, made here, before any state is touched.  The v2 branch
+    # hands the entire context to autotune_v2() and returns; the v1 body
+    # below never runs for it.  The two implementations therefore never share
+    # a function scope, so no later edit can accidentally make one path
+    # observe the other's state.  Each branch is named positively and rejects
+    # only the arguments the *other* implementation owns, so adding a third
+    # means adding a case rather than widening what "not v2" happens to mean.
+    # Design doc: docs/design_docs/autotuner_v2.md §2.1, §5.1.
+    if v2_opt_in:
+        _reject_v1_only_args(cache)
+        from ..autotune_cache import autotune_v2
+
+        with autotune_v2(
+            mode="tune" if tune_mode else "replay",
+            persistent_cache=persistent_cache,
+            cache_root=cache_root,
+            tuning_buckets=tuning_buckets,
+            round_up=round_up,
+            skip_ops=skip_ops,
+            measure=measure,
+        ):
+            yield
+        return
+
+    _reject_v2_only_args(cache_root, persistent_cache, measure)
+
+    # ---- v1 implementation ----------------------------------------------
 
     # Load configs from cache file on entry (if it exists).  A file with
     # mismatched metadata is ignored here; whether it may be overwritten on
