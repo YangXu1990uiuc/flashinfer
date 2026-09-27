@@ -40,7 +40,7 @@ _WEIGHT_KEYS = (
     "fc1_input_scale",
     "fc2_input_scale",
 )
-_TAG = "cudnn_frost-mxfp8-moe-v1"
+_TAG = "cudnn_frost-mxfp8-moe-prepared-v5"
 
 
 def _tensor_version(tensor):
@@ -60,7 +60,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost MXFP8 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_mxfp8_moe_v1_{arch}",
+        f"cudnn_frost_mxfp8_moe_prepared_v3_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_mxfp8.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()
@@ -139,9 +139,31 @@ class _Plans:
         module = _module(common._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
+            direct = (
+                common._arch_for(device) == "sm_107a"
+                and (hidden, intermediate, experts, topk)
+                in ((2048, 1408, 64, 6), (7168, 3072, 12, 2))
+                and tokens * topk <= 128
+                and a.activation == "swiglu"
+            )
+
+            def prepare_launch(kernel):
+                if not direct:
+                    return common._load_kernel(kernel, device)
+                from ....jit.env import FLASHINFER_GEN_SRC_DIR
+                from ..low_latency_source import make_source
+
+                path, digest = make_source(
+                    kernel,
+                    FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles",
+                    "static_absolute_all_v3",
+                )
+                with torch.cuda.device(device):
+                    return common._load_source(path, digest, kernel.arch, device.index)
+
             plan = module.make_plan(
-                common._load_kernel(a, device),
-                common._load_kernel(b, device),
+                prepare_launch(a),
+                prepare_launch(b),
                 tokens,
                 hidden,
                 intermediate,

@@ -40,7 +40,7 @@ def _module(arch):
         raise ValueError("cuDNN Frost BF16 MoE kernels require SM107a")
 
     return gen_jit_spec(
-        f"cudnn_frost_bf16_moe_v2_{arch}",
+        f"cudnn_frost_bf16_moe_prepared_v3_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_bf16.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()

@@ -413,16 +413,16 @@ class MoELayer:
                 return runner, tactic
             from ..testing.utils import bench_gpu_time
 
-            # Measure runner at its winning tactic.  Use CUDA-graph timing so
-            # the cross-backend comparison reflects production (graph-captured)
-            # latency rather than per-call launch/Python overhead — at low token
-            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
-            # by that overhead and picks the wrong backend.  Requires a warmed-up
-            # layer (the autotune pass above), not a cold capture.
+            # Compare the GPU work performed by each user call. Some runners
+            # pack routing tensors on the GPU in pack_inputs(), so timing only
+            # forward() can select a slower complete MoELayer call. One-time
+            # weight preparation is already warmed by the autotune pass above.
+            def run_candidate(r=runner, t=tactic):
+                packed = r.pack_inputs(act_pack, weight_pack)
+                return r.forward(packed, tactic=t, **r.launch_kwargs_for(packed))
+
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
-                    i, tactic=t, **kw
-                ),
+                run_candidate,
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,

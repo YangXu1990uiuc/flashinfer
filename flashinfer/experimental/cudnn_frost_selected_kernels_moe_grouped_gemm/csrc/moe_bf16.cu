@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 
+#include "moe_finalize.cuh"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
@@ -31,6 +32,28 @@ __global__ void histogram(const int32_t* ids, int32_t* counts, int rows, int exp
   }
 }
 
+__global__ void histogram_local(const int32_t* ids, int32_t* counts, int rows, int experts) {
+  if (experts > 128) {
+    for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < rows;
+         r += int64_t(blockDim.x) * gridDim.x) {
+      int e = ids[r];
+      atomicAdd(counts + (e >= 0 && e < experts ? e : 0), 1);
+    }
+    return;
+  }
+  __shared__ int local[128];
+  if (threadIdx.x < experts) local[threadIdx.x] = 0;
+  __syncthreads();
+  for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < rows;
+       r += int64_t(blockDim.x) * gridDim.x) {
+    int e = ids[r];
+    atomicAdd(local + (e >= 0 && e < experts ? e : 0), 1);
+  }
+  __syncthreads();
+  if (threadIdx.x < experts && local[threadIdx.x])
+    atomicAdd(counts + threadIdx.x, local[threadIdx.x]);
+}
+
 __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors, int experts,
                        float* scale) {
   int start = 0;
@@ -41,6 +64,41 @@ __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors
   scale[0] = 1.f;
   scale[1] = 4.f;
   scale[2] = 25.f;
+}
+
+__global__ void prefix_parallel(const int32_t* counts, int32_t* offsets, int32_t* cursors,
+                                int experts, float* scale) {
+  if (experts > 128) {
+    if (threadIdx.x == 0) {
+      int sum = 0;
+      for (int e = 0; e < experts; e++) {
+        offsets[e] = cursors[e] = sum;
+        sum += counts[e];
+      }
+      scale[0] = 1.f;
+      scale[1] = 4.f;
+      scale[2] = 25.f;
+    }
+    return;
+  }
+  int t = threadIdx.x, lane = t % 32, warp = t / 32;
+  int value = t < experts ? counts[t] : 0, scan = value;
+#pragma unroll
+  for (int d = 1; d < 32; d *= 2) {
+    int v = __shfl_up_sync(0xffffffff, scan, d);
+    if (lane >= d) scan += v;
+  }
+  __shared__ int sums[4];
+  if (lane == 31) sums[warp] = scan;
+  __syncthreads();
+  int before = scan - value;
+  for (int w = 0; w < warp; w++) before += sums[w];
+  if (t < experts) offsets[t] = cursors[t] = before;
+  if (t == 0) {
+    scale[0] = 1.f;
+    scale[1] = 4.f;
+    scale[2] = 25.f;
+  }
 }
 
 __global__ void gather(const __nv_bfloat16* x, const int32_t* ids, int32_t* cursors,
@@ -60,6 +118,26 @@ __global__ void gather(const __nv_bfloat16* x, const int32_t* ids, int32_t* curs
     for (int h = threadIdx.x; h < hidden / 8; h += blockDim.x)
       target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
     __syncthreads();
+  }
+}
+
+__global__ void gather_warp(const __nv_bfloat16* x, const int32_t* ids, int32_t* cursors,
+                            int32_t* mapping, __nv_bfloat16* grouped, int rows, int hidden,
+                            int topk, int experts) {
+  int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  for (int64_t r = int64_t(blockIdx.x) * 4 + warp; r < rows; r += int64_t(gridDim.x) * 4) {
+    int e = ids[r];
+    bool valid = e >= 0 && e < experts;
+    int dest = 0;
+    if (lane == 0) {
+      dest = atomicAdd(cursors + (valid ? e : 0), 1);
+      mapping[r] = dest;
+    }
+    dest = __shfl_sync(0xffffffff, dest, 0);
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 8);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 8);
+    for (int h = lane; h < hidden / 8; h += 32)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
   }
 }
 
@@ -145,6 +223,136 @@ __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const
   }
 }
 
+union alignas(16) Bf16x8 {
+  uint4 bits;
+  __nv_bfloat162 pairs[4];
+};
+
+template <int TOPK>
+__global__ __launch_bounds__(256, 2) void finalize_vec8(
+    const __nv_bfloat16* __restrict__ grouped, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ mapping, const float* __restrict__ scores, int expert_count,
+    __nv_bfloat16* __restrict__ output, int tokens, int hidden) {
+  constexpr int kThreads = 256;
+  constexpr int kElements = 8;
+  const int vectors_per_row = hidden / kElements;
+  const int tiles_per_row = (vectors_per_row + kThreads - 1) / kThreads;
+  const int tile = static_cast<int>(blockIdx.x);
+  const int token = tile / tiles_per_row;
+  const int vector = (tile - token * tiles_per_row) * kThreads + threadIdx.x;
+  if (token >= tokens || vector >= vectors_per_row) return;
+  const unsigned mask = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  float2 accum[4];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) accum[q] = make_float2(0.0f, 0.0f);
+#pragma unroll
+  for (int j = 0; j < TOPK; ++j) {
+    int expert = lane == j ? __ldg(ids + token * TOPK + j) : 0;
+    int row = lane == j ? __ldg(mapping + token * TOPK + j) : 0;
+    float weight = lane == j ? __ldg(scores + token * TOPK + j) : 0.0f;
+    expert = __shfl_sync(mask, expert, j);
+    row = __shfl_sync(mask, row, j);
+    weight = __shfl_sync(mask, weight, j);
+    if (expert >= 0 && expert < expert_count) {
+      Bf16x8 value;
+      value.bits =
+          reinterpret_cast<const uint4*>(grouped + static_cast<int64_t>(row) * hidden)[vector];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float2 x = __bfloat1622float2(value.pairs[q]);
+        accum[q].x = fmaf(x.x, weight, accum[q].x);
+        accum[q].y = fmaf(x.y, weight, accum[q].y);
+      }
+    }
+  }
+  Bf16x8 result;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) result.pairs[q] = __floats2bfloat162_rn(accum[q].x, accum[q].y);
+  reinterpret_cast<uint4*>(output + static_cast<int64_t>(token) * hidden)[vector] = result.bits;
+}
+
+#define VEC 8  // bf16 elements per 16B vector load
+
+__device__ __forceinline__ void accum_vec(float (&acc)[VEC], const uint4 r, const float w) {
+  const unsigned int u[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    // bf16 -> f32 is a pure bit shift, no rounding.
+    acc[2 * i + 0] = fmaf(__uint_as_float(u[i] << 16), w, acc[2 * i + 0]);
+    acc[2 * i + 1] = fmaf(__uint_as_float(u[i] & 0xffff0000u), w, acc[2 * i + 1]);
+  }
+}
+
+__device__ __forceinline__ uint4 pack_bf16(const float (&acc)[VEC]) {
+  uint4 o;
+  unsigned int* op = reinterpret_cast<unsigned int*>(&o);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    __nv_bfloat162 p = __floats2bfloat162_rn(acc[2 * i + 0], acc[2 * i + 1]);
+    op[i] = *reinterpret_cast<unsigned int*>(&p);
+  }
+  return o;
+}
+
+// Vectorized kernel: blockIdx.y = token, blockIdx.x tiles the hidden dim.
+// Each thread owns U independent 16B lanes so that U*K loads are in flight.
+template <int K, int U, int BD>
+__global__ void __launch_bounds__(BD)
+    finalize_vec_kernel(const __nv_bfloat16* __restrict__ grouped, const int* __restrict__ ids,
+                        const int* __restrict__ mapping, const float* __restrict__ scores,
+                        const int E, __nv_bfloat16* __restrict__ output, const int H,
+                        const int nvec) {
+  const int t = blockIdx.y;
+
+  const uint4* __restrict__ rows[K];
+  float w[K];
+  bool valid[K];
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    const int id = __ldg(ids + (size_t)t * K + j);
+    const int m = __ldg(mapping + (size_t)t * K + j);
+    valid[j] = id >= 0 && id < E;
+    w[j] = valid[j] ? __ldg(scores + (size_t)t * K + j) : 0.0f;
+    rows[j] = reinterpret_cast<const uint4*>(grouped + (size_t)(valid[j] ? m : 0) * H);
+  }
+  uint4* __restrict__ out = reinterpret_cast<uint4*>(output + (size_t)t * H);
+
+  const int v0 = blockIdx.x * (BD * U) + threadIdx.x;
+
+  if (v0 + (U - 1) * BD < nvec) {
+    uint4 raw[U][K];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+#pragma unroll
+      for (int j = 0; j < K; ++j)
+        raw[u][j] = valid[j] ? __ldg(rows[j] + (v0 + u * BD)) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      float acc[VEC];
+#pragma unroll
+      for (int i = 0; i < VEC; ++i) acc[i] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < K; ++j) accum_vec(acc, raw[u][j], w[j]);
+      out[v0 + u * BD] = pack_bf16(acc);
+    }
+  } else {
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int v = v0 + u * BD;
+      if (v >= nvec) break;
+      float acc[VEC];
+#pragma unroll
+      for (int i = 0; i < VEC; ++i) acc[i] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < K; ++j)
+        if (valid[j]) accum_vec(acc, __ldg(rows[j] + v), w[j]);
+      out[v] = pack_bf16(acc);
+    }
+  }
+}
+
+#undef VEC
 void tensor(TensorView t, DLDevice device, DLDataType dtype, std::initializer_list<int64_t> shape,
             size_t alignment = 16) {
   TVM_FFI_ICHECK(t.device().device_type == kDLCUDA && t.device().device_id == device.device_id);
@@ -213,6 +421,8 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
 
   const char* kind() const final { return "cudnn_frost_bf16_moe_plan"; }
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
+    if (name == "finalize_variant")
+      return Function::FromTyped([this]() { return finalize_variant(); });
     if (name == "workspace_size")
       return Function::FromTyped([this]() { return int64_t(workspace_size_); });
     if (name == "run")
@@ -224,6 +434,10 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
   }
 
  private:
+  int64_t finalize_variant() const {
+    if (frost_moe_finalize::small_supported(t_, h_, i_, e_, k_)) return 1;
+    return 0;
+  }
   void run(TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
            TensorView w2, TensorView workspace) const {
     tensor(out, device_, dl_bfloat16, {t_, h_});
@@ -253,12 +467,23 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
           s_, h_, k_, e_);
     } else {
       checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
-                                                                               s_, e_);
-      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
-      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-          static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
-          e_);
+      if (s_ >= 16384 && e_ >= 32) {
+        histogram_local<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(
+            expert_ids, counts, s_, e_);
+      } else {
+        histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                                 s_, e_);
+      }
+      prefix_parallel<<<1, 128, 0, stream>>>(counts, offsets, cursors, e_, scale);
+      if (s_ >= 8192) {
+        gather_warp<<<std::min<int64_t>((s_ + 3) / 4, 4096), 128, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
+            e_);
+      } else {
+        gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
+            e_);
+      }
     }
     checked(cudaGetLastError());
 
@@ -310,7 +535,36 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     fc2_(problem2_, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tm),
          TensorView(swap2_ ? &tm : &down), TensorView(swap2_ ? &ty_sw : &ty),
          static_cast<void*>(stream));
-    if (t_ <= 8) {
+    const auto finalize_path = finalize_variant();
+    if (finalize_path == 1) {
+      frost_moe_finalize::launch_small(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, e_, k_, stream);
+    } else if (t_ > 8 && t_ <= 512 && (k_ == 2 || k_ == 6) && h_ % 256 == 0) {
+      const int grid = t_ * ((h_ / 8 + 255) / 256);
+      if (k_ == 2) {
+        finalize_vec8<2><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_);
+      } else {
+        finalize_vec8<6><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_);
+      }
+    } else if (t_ > 512 && t_ <= 65535 && (k_ == 2 || k_ == 6) && h_ % 256 == 0) {
+      const int vectors = h_ / 8;
+      if (k_ == 2) {
+        dim3 grid((vectors + 511) / 512, t_);
+        finalize_vec_kernel<2, 2, 256><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, vectors);
+      } else {
+        dim3 grid((vectors + 255) / 256, t_);
+        finalize_vec_kernel<6, 1, 256><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, vectors);
+      }
+    } else if (t_ <= 8) {
       finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
           static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);

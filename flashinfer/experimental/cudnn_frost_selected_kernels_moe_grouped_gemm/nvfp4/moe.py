@@ -30,7 +30,7 @@ from ..cache import (
 from ..capabilities import require_compiler
 from ..shortlist import _read, select
 from . import runtime
-from .support import is_eligible
+from .support import _token_limit, is_eligible
 
 _WEIGHT_KEYS = (
     "fc1_expert_weights",
@@ -42,7 +42,7 @@ _WEIGHT_KEYS = (
     "fc2_weight_block_scale",
     "fc2_dequant_scale",
 )
-_TAG = "cudnn_frost-nvfp4-moe-v1"
+_TAG = "cudnn_frost-nvfp4-moe-pathfinding-r29"
 
 
 def _tensor_version(tensor):
@@ -62,7 +62,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost NVFP4 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_nvfp4_moe_v1_{arch}",
+        f"cudnn_frost_nvfp4_moe_prepared_r29_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_nvfp4.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()
@@ -102,7 +102,9 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
     # Reuse the common next-measured-token bucket, while refusing the explicit
     # legacy path that returns an unfiltered pool when no profile table exists.
-    if not profiles or not 0 < tokens <= 12288:
+    if not profiles or not 0 < tokens <= _token_limit(
+        experts, hidden, intermediate, topk, name
+    ):
         return (), ()
     bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
     if any(len(ids) != 2 for ids in profiles[bucket]):
@@ -123,6 +125,59 @@ class _Inputs(list):
 
 
 class _Plans:
+    @staticmethod
+    def _strategy_supported(a, b, strategy):
+        # The retained-input geometry and task grouping are artifact-specific.
+        # Unchanged profiles retain the existing selection contract.
+        if strategy in ("default", "latency"):
+            return True
+        first = (
+            a.artifact_id
+            == "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster2x1_2ctamma_clc_stg"
+        )
+        second = (
+            b.artifact_id
+            == "block_scale_grouped_gemm2_sm_107a_256x256x128_128x256x64_cluster2x1_2ctamma_swapAB_clc_tma"
+        )
+        if strategy == "input_reuse":
+            return first
+        if strategy == "tile_pair":
+            return second
+        return strategy == "input_reuse_tile_pair" and first and second
+
+    @staticmethod
+    def _profiles(tokens, hidden, intermediate, experts, topk, device, first):
+        # Keep original and individual/combined candidates in the measured
+        # throughput envelope. Stock tuning includes these in its cache key.
+        if (
+            common._arch_for(device) == "sm_107a"
+            and (experts, hidden, intermediate, topk) == (128, 2048, 768, 8)
+            and 9216 <= tokens <= 12288
+            and first
+            and first[0].activation == "swiglu"
+        ):
+            return ("default", "input_reuse", "tile_pair", "input_reuse_tile_pair")
+        # Keep both prepared schedules in the measured crossover envelope.
+        # Stock autotuning chooses a strategy with the GEMM combination.
+        if (
+            common._arch_for(device) == "sm_107a"
+            and (
+                (
+                    (experts, hidden, intermediate, topk) == (8, 4096, 14336, 2)
+                    and 513 <= tokens <= 12288
+                )
+                or (
+                    (experts, hidden, intermediate, topk)
+                    in ((64, 2048, 1408, 6), (12, 7168, 3072, 2))
+                    and 513 <= tokens <= 8191
+                )
+            )
+            and first
+            and first[0].activation == "swiglu"
+        ):
+            return ("default", "latency")
+        return ("default",)
+
     def __init__(
         self,
         tokens,
@@ -137,13 +192,235 @@ class _Plans:
         swizzled=False,
     ):
         self.plans, self.launches = {}, {}
+        self.tiny_code_owners = []
         required = 0
         module = _module(common._arch_for(device))
-        for a, b in product(first, second):
-            key = (_TAG, a.tactic, b.tactic)
+        profiles = self._profiles(
+            tokens, hidden, intermediate, experts, topk, device, first
+        )
+        for a, b, strategy in product(first, second, profiles):
+            if not self._strategy_supported(a, b, strategy):
+                continue
+            reuse_first = strategy in ("input_reuse", "input_reuse_tile_pair")
+            pair_second = strategy in ("tile_pair", "input_reuse_tile_pair")
+            key = (_TAG, a.tactic, b.tactic) + (
+                (strategy,) if strategy != "default" else ()
+            )
+            # These measured prototype regions are separate from the general
+            # throughput path. All source/launch preparation stays outside run().
+            shape_supported = (hidden, intermediate, experts, topk) in (
+                (2048, 1408, 64, 6),
+                (7168, 3072, 12, 2),
+            )
+            latency_shape_supported = shape_supported or (
+                hidden,
+                intermediate,
+                experts,
+                topk,
+            ) in ((2048, 768, 128, 8), (4096, 14336, 8, 2))
+            direct = (
+                common._arch_for(device) == "sm_107a"
+                and shape_supported
+                and tokens * topk <= 128
+                and a.activation == "swiglu"
+            )
+            prepared_latency = (
+                common._arch_for(device) == "sm_107a"
+                and latency_shape_supported
+                and not direct
+                and (0 < tokens <= 512 or strategy == "latency")
+                and a.activation == "swiglu"
+            )
+            prepared_throughput = (
+                common._arch_for(device) == "sm_107a"
+                and shape_supported
+                and 8192 <= tokens <= 32768
+                and a.activation == "swiglu"
+            )
+            input_fused = (
+                common._arch_for(device) == "sm_107a"
+                and (experts, hidden, intermediate, topk) == (128, 2048, 768, 8)
+                and 8192 <= tokens <= 12288
+                and a.activation == "swiglu"
+                and not a.swap_ab
+                and a.tactic_metadata.get("store_mode") == "stg"
+            )
+            fused_quant = (
+                common._arch_for(device) == "sm_107a"
+                and (
+                    (shape_supported and (direct or 513 <= tokens <= 32768))
+                    or (
+                        (experts, hidden, intermediate, topk) == (8, 4096, 14336, 2)
+                        and 513 <= tokens <= 12288
+                    )
+                )
+                and a.activation == "swiglu"
+                and not a.swap_ab
+                and a.tactic_metadata.get("store_mode") == "stg"
+            )
+
+            # Keep the wider swapped tile on its existing path: its measured
+            # cold-cache crossover did not justify enabling this fusion.
+            swap_fused = (
+                common._arch_for(device) == "sm_107a"
+                and (
+                    shape_supported
+                    or (hidden, intermediate, experts, topk) == (4096, 14336, 8, 2)
+                )
+                and 0 < tokens <= (512 if experts in (8, 12) else 128)
+                and a.activation == "swiglu"
+                and a.swap_ab
+                and a.tactic_metadata.get("store_mode") == "tma"
+                and a.tactic_metadata.get("cta_tile", {}).get("m") == 128
+            )
+            fused_quant = fused_quant or input_fused or swap_fused
+            e128_tiny = (
+                common._arch_for(device) == "sm_107a"
+                and (experts, hidden, intermediate, topk) == (128, 2048, 768, 8)
+                and 0 < tokens <= 8
+                and a.activation == "swiglu"
+            )
+            fused_quant = fused_quant or (e128_tiny and not a.swap_ab)
+
+            # Two-kernel latency specialization in explicitly measured regions.
+            # The logical GEMM tactics remain aliases here; their normal pipeline
+            # is retained outside this bounded envelope.
+            slot_tasks = (
+                common._arch_for(device) == "sm_107a"
+                and (
+                    (
+                        (experts, hidden, intermediate, topk)
+                        in ((128, 2048, 768, 8), (64, 2048, 1408, 6))
+                        and 0 < tokens <= 4
+                    )
+                    or (
+                        (experts, hidden, intermediate, topk) == (12, 7168, 3072, 2)
+                        and tokens == 1
+                    )
+                )
+                and a.activation == "swiglu"
+            )
+            fused_quant = fused_quant or slot_tasks
+
+            def prepare_launch(kernel, fuse=False, indirect=False):
+                if pair_second and not kernel.fc1:
+                    from ....jit.env import FLASHINFER_GEN_SRC_DIR
+                    from .reuse_source import make_source as make_reuse_source
+
+                    cache_root = (
+                        FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles"
+                    )
+                    path, digest = make_reuse_source(kernel, cache_root, "fc2")
+                    with torch.cuda.device(device):
+                        return common._load_source(
+                            path, digest, kernel.arch, device.index
+                        )
+                if not (direct or prepared_latency or prepared_throughput or fuse):
+                    return common._load_kernel(kernel, device)
+                from ....jit.env import FLASHINFER_GEN_SRC_DIR
+                from types import SimpleNamespace
+
+                path, digest = kernel.source_path, kernel.source_sha256
+                cache_root = FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles"
+                if direct or prepared_latency or prepared_throughput:
+                    from ..low_latency_source import make_source
+
+                    profile = (
+                        "static_absolute_all_v3"
+                        if direct
+                        else (
+                            "static_general_plain_absolute"
+                            if prepared_latency
+                            else "absolute"
+                        )
+                    )
+                    path, digest = make_source(kernel, cache_root, profile)
+                    if not slot_tasks and e128_tiny and tokens <= 4:
+                        from .latency_source import sparse_source
+
+                        path, digest = sparse_source(
+                            SimpleNamespace(source_path=path, swap_ab=kernel.swap_ab),
+                            cache_root,
+                        )
+
+                if fuse:
+                    if kernel.swap_ab:
+                        from .swap_fused_quant import (
+                            make_source as make_swap_fused_source,
+                        )
+
+                        path, digest = make_swap_fused_source(
+                            SimpleNamespace(source_path=path),
+                            cache_root,
+                            omit_output_descriptor=experts == 64,
+                        )
+                    elif kernel.tactic_metadata.get("store_mode") == "tma":
+                        from .latency_source import normal_tma
+
+                        path, digest = normal_tma(
+                            SimpleNamespace(source_path=path), cache_root, omit=True
+                        )
+                    else:
+                        from .fused_quant import make_fused_source
+
+                        path, digest = make_fused_source(
+                            SimpleNamespace(source_path=path, swap_ab=kernel.swap_ab),
+                            cache_root,
+                            packed_epilogue=(shape_supported and 513 <= tokens <= 8191)
+                            or prepared_throughput
+                            or input_fused
+                            or (
+                                (experts, hidden, intermediate, topk)
+                                == (8, 4096, 14336, 2)
+                                and 513 <= tokens <= 12288
+                            ),
+                        )
+                if indirect:
+                    from .input_source import make_source as make_input_source
+
+                    path, digest = make_input_source(
+                        SimpleNamespace(source_path=path), cache_root
+                    )
+                if reuse_first and kernel.fc1:
+                    assert indirect
+                    from .reuse_source import make_source as make_reuse_source
+
+                    path, digest = make_reuse_source(
+                        SimpleNamespace(source_path=path), cache_root, "fc1"
+                    )
+                if slot_tasks:
+                    from .slot_source import make_source as make_slot_source
+
+                    path, digest = make_slot_source(
+                        SimpleNamespace(source_path=path, swap_ab=False),
+                        cache_root,
+                        fc1=kernel.fc1,
+                        swizzled=swizzled,
+                        tokens=tokens,
+                    )
+                with torch.cuda.device(device):
+                    return common._load_source(path, digest, kernel.arch, device.index)
+
+            if slot_tasks:
+                from .tiny_runtime import build_first, build_second
+
+                first_code = build_first(
+                    tokens, swizzled, device.index, experts, intermediate, topk, hidden
+                )
+                second_code = build_second(
+                    tokens, device.index, experts, intermediate, topk, hidden
+                )
+                self.tiny_code_owners.extend((first_code, second_code))
+                launch1, launch2 = (
+                    first_code.__tvm_ffi_object__(),
+                    second_code.__tvm_ffi_object__(),
+                )
+            else:
+                launch1 = prepare_launch(a, fused_quant, input_fused)
+                launch2 = prepare_launch(b)
             plan = module.make_plan(
-                common._load_kernel(a, device),
-                common._load_kernel(b, device),
+                launch1,
+                launch2,
                 tokens,
                 hidden,
                 intermediate,
@@ -155,9 +432,12 @@ class _Plans:
                 a.gated,
                 [runtime._TAIL_SLOTS[name] for name in a.launch_tail],
                 [runtime._TAIL_SLOTS[name] for name in b.launch_tail],
-                a.swap_ab,
-                b.swap_ab,
+                False if slot_tasks else a.swap_ab,
+                False if slot_tasks else b.swap_ab,
                 swizzled,
+                fused_quant,
+                input_fused,
+                slot_tasks,
             )
             self.plans[key], self.launches[key] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
@@ -203,7 +483,7 @@ def prepared_stage_inputs(inputs, *, tactic=None):
 
 
 class CudnnFrostNvfp4MoeRunner(MoERunner):
-    """Four measured FC1/FC2 combinations per supported problem-size bucket.
+    """Measured FC1/FC2 combinations with bounded prepared strategy choices.
 
     Prepared weight scales are static during CUDA Graph replay. Updating an
     ordinary block-scale tensor and calling ``pack_inputs`` again refreshes its
@@ -510,7 +790,20 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        return [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        profiles = _Plans._profiles(
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            self.device,
+            first,
+        )
+        return [
+            (_TAG, a.tactic, b.tactic) + ((strategy,) if strategy != "default" else ())
+            for a, b, strategy in product(first, second, profiles)
+            if _Plans._strategy_supported(a, b, strategy)
+        ]
 
     def get_cache_key_extras(self, inputs):
         return super().get_cache_key_extras(inputs) + (

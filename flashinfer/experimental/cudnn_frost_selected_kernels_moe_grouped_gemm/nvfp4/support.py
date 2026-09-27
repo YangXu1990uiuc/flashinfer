@@ -8,6 +8,16 @@ from ..activations import activation_name
 from ..support import shortlisted_moe_geometry
 
 
+def _token_limit(experts, hidden, intermediate, topk, activation):
+    """Only the validated NVFP4 SwiGLU geometries admit longer prefill calls."""
+    if activation == "swiglu" and (experts, hidden, intermediate, topk) in (
+        (64, 2048, 1408, 6),
+        (12, 7168, 3072, 2),
+    ):
+        return 32768
+    return 12288
+
+
 def is_eligible(config, act, arch):
     x = act.hidden_states_q
     if not (
@@ -20,10 +30,18 @@ def is_eligible(config, act, arch):
     ):
         return False
     try:
-        activation_name(config.activation)
+        name = activation_name(config.activation)
     except NotImplementedError:
         return False
-    return shortlisted_moe_geometry(config, act, hidden_size=2 * x.shape[1])
+    hidden = 2 * x.shape[1]
+    limit = _token_limit(
+        config.routing.num_experts,
+        hidden,
+        config.experts.intermediate_size,
+        config.routing.top_k,
+        name,
+    )
+    return shortlisted_moe_geometry(config, act, hidden_size=hidden, max_tokens=limit)
 
 
 def create_runner(config, device):
