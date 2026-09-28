@@ -1865,9 +1865,9 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     monkeypatch.setattr(
         moe,
         "_kernels",
-        lambda *args, **kwargs: ((), ())
-        if kwargs.get("quantized_output")
-        else (first, second),
+        lambda *args, **kwargs: (
+            ((), ()) if kwargs.get("quantized_output") else (first, second)
+        ),
     )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
     monkeypatch.setattr(moe, "_read", lambda roots: table)
@@ -3406,3 +3406,211 @@ def test_frost_moe_declines_missing_graph_ownership(method, monkeypatch):
     monkeypatch.setattr(torch.cuda.CUDAGraph, method, None, raising=False)
     with pytest.raises(NotImplementedError, match=method):
         require_graph_resource_retention()
+
+
+@supported_gpu
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "mxfp8_mxfp4", "nvfp4"])
+@pytest.mark.parametrize("tokens", [1, 8, 128, 1536])
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (12, 7168, 3072, 2)])
+def test_model_geometry_native_routes(dtype, tokens, geometry, monkeypatch):
+    """Exercise physical tiny, ordinary, and large routing with every tactic."""
+    _assert_model_geometry_native_routes(dtype, tokens, geometry, monkeypatch)
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 4, 8, 256, 8192, 9216, 12288])
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_nvfp4_additional_model_geometry(tokens, swizzled, monkeypatch):
+    _assert_model_geometry_native_routes(
+        "nvfp4", tokens, (128, 2048, 768, 8), monkeypatch, swizzled=swizzled
+    )
+
+
+def _assert_model_geometry_native_routes(
+    dtype, tokens, geometry, monkeypatch, swizzled=False
+):
+    from flashinfer import fused_moe
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
+    torch.manual_seed(5628 + tokens)
+    experts, hidden, intermediate, topk = geometry
+    moe = importlib.import_module(
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.moe"
+    )
+    suffix = {
+        "bf16": "Bf16",
+        "mxfp8": "Mxfp8",
+        "mxfp8_mxfp4": "Mxfp8Mxfp4",
+        "nvfp4": "Nvfp4",
+    }[dtype]
+    backend = getattr(fused_moe, f"Cutlass{suffix}Config")
+    q = fused_moe.QuantFormat
+    quant = {
+        "bf16": QuantConfig(),
+        "mxfp8": QuantConfig(q.MXFP8, q.MXFP8),
+        "mxfp8_mxfp4": QuantConfig(q.MXFP4, q.MXFP8),
+        "nvfp4": QuantConfig(q.NVFP4, q.NVFP4, swizzled_scale_factors=swizzled),
+    }[dtype]
+    config = replace(
+        bf16_config(topk=topk, experts=experts, intermediate=intermediate),
+        quant=quant,
+        backend=BackendOptions((backend(),)),
+        activation=SwiGLU(),
+    )
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    w1 = (
+        torch.randn(
+            experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02
+    )
+    w2 = (
+        torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16)
+        * 0.02
+    )
+    if dtype == "bf16":
+        xq, xsf = x, None
+        view = dict(fc1_expert_weights=w1, fc2_expert_weights=w2)
+    else:
+        xq, xsf = backend.prepare_activations(x, quant=quant)
+        if swizzled:
+            from flashinfer.quantization.fp4_quantization import (
+                nvfp4_block_scale_interleave,
+            )
+
+            xsf = nvfp4_block_scale_interleave(xsf.view(torch.uint8))
+        view = backend.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=SwiGLU(),
+        )
+    ids = torch.randint(
+        0, experts // 2, (tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    scores = torch.rand(tokens, topk, device="cuda").softmax(-1)
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({f"cutlass_{dtype}": view})
+    runner = getattr(moe, f"CudnnFrost{suffix}MoeRunner")(config, "cuda")
+    runner.check_support()
+    runner.build()
+    assert runner.accepts(act, weights)
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert len(tactics) >= 4
+    if dtype == "nvfp4" and experts == 128 and tokens >= 8192:
+        fused = [
+            tactic
+            for tactic in tactics
+            if "input_fusion" in tactic or "input_reuse" in tactic
+        ]
+        assert fused
+        if tokens >= 9216:
+            assert any("input_reuse" in tactic for tactic in fused)
+        assert all(
+            inputs.launch_state.plans[tactic]["input_fused_enabled"]()
+            for tactic in fused
+        )
+        for tactic in fused:
+            with pytest.raises(
+                Exception, match="do not materialize grouped stage inputs"
+            ):
+                moe.prepared_stage_inputs(inputs, tactic=tactic)
+    # Require actual FMA and Tensor Core plans where the bounded FMA route applies.
+    fma_tactic = moe._fma_tactic(tokens, hidden, intermediate, experts, topk, SwiGLU())
+    if tokens <= 4:
+        assert fma_tactic is not None and fma_tactic in tactics
+    else:
+        assert fma_tactic is None
+
+    def reference():
+        # Cover the beginning and tail without materializing a full reference prefill.
+        ix = torch.tensor(
+            sorted(set(range(min(tokens, 8))) | {tokens - 1}), device="cuda"
+        )
+        if swizzled:
+            row = ix[:, None]
+            col = torch.arange(hidden // 16, device="cuda")[None, :]
+            sf_index = (
+                (row // 128) * 128 * (hidden // 16)
+                + (col // 4) * 512
+                + (row % 32) * 16
+                + ((row % 128) // 32) * 4
+                + col % 4
+            )
+            sample_sf = (
+                xsf.view(torch.uint8).flatten()[sf_index].view(torch.float8_e4m3fn)
+            )
+        else:
+            sample_sf = xsf[ix] if xsf is not None else None
+        sample = MoEActivationPack(xq[ix], sample_sf, ids[ix], scores[ix])
+        if dtype == "bf16":
+            expected = _bf16_moe_reference(sample, weights)
+        elif dtype == "nvfp4":
+            expected = _nvfp4_moe_reference(sample, weights, SwiGLU())
+        else:
+            expected = _mxfp8_moe_reference(
+                sample, weights, SwiGLU(), mixed=dtype == "mxfp8_mxfp4"
+            )
+        return ix, expected
+
+    def check(out, ix, expected):
+        assert torch.isfinite(out).all()
+        actual = out[ix].float()
+        expected = expected.float()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.05, atol=0.01 * expected.abs().max().item()
+        )
+        assert (actual - expected).norm() / expected.norm().clamp_min(1e-12) < 0.02
+
+    ix, expected = reference()
+    graphs = []
+    for tactic in tactics:
+        out = runner.forward(inputs, tactic)
+        check(out, ix, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner.forward(list(inputs), tactic, launch_state=inputs.launch_state)
+        graphs.append(graph)
+    # Replay all captured physical paths with duplicate routes, empty experts,
+    # invalid routes, and changed scale bytes; no preparation may run in replay.
+    ids.fill_(experts - 1)
+    ids[::3, 0] = -1
+    ids[1::3, -1] = experts
+    scores.mul_(0.5)
+    if dtype == "bf16":
+        xq.neg_()
+    else:
+        xq.view(torch.uint8).bitwise_xor_(0x88 if dtype == "nvfp4" else 0x80)
+        xsf.view(torch.uint8).add_(1)
+    ix, expected = reference()
+    for graph in graphs:
+        inputs[0].fill_(float("nan"))
+        graph.replay()
+        check(inputs[0], ix, expected)
+    scores.zero_()
+    for graph in graphs:
+        graph.replay()
+        assert torch.count_nonzero(inputs[0]) == 0
+
+
+def test_prepared_profile_tactics_track_compiler_changes(monkeypatch):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+        prepared,
+    )
+
+    current = ["bundled"]
+    monkeypatch.setattr(compiler, "identity_key", lambda: current[0])
+    first, second = SimpleNamespace(tactic=("fc1",)), SimpleNamespace(tactic=("fc2",))
+    original = prepared.plan_key("tag", first, second, None)
+    before = prepared.plan_key("tag", first, second, "absolute")
+    current[0] = "different-assembler"
+    after = prepared.plan_key("tag", first, second, "absolute")
+    assert before != after
+    assert prepared.plan_key("tag", first, second, None) == original
+    current[0] = "bundled"
+    assert prepared.plan_key("tag", first, second, "absolute") == before

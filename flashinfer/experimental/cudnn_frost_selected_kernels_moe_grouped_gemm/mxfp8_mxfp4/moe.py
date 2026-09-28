@@ -20,6 +20,7 @@ from ....fused_moe.api import QuantFormat, RoutingInputMode
 from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
 from .. import runtime as common
+from .. import prepared
 from ..activations import ACTIVATIONS, activation_name
 from ..cache import (
     LRUCache,
@@ -40,7 +41,7 @@ _WEIGHT_KEYS = (
     "fc1_input_scale",
     "fc2_input_scale",
 )
-_TAG = "cudnn_frost-mxfp8_mxfp4-moe-v2"
+_TAG = "cudnn_frost-mxfp8_mxfp4-moe-post5628-v1"
 
 
 def _tensor_version(tensor):
@@ -60,7 +61,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost MXFP8 × MXFP4 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_mxfp8_mxfp4_moe_v2_{arch}",
+        f"cudnn_frost_mxfp8_mxfp4_moe_post5628_v1_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_mxfp8_mxfp4.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()
@@ -170,11 +171,20 @@ class _Plans:
         self.plans, self.launches = {}, {}
         required = 0
         module = _module(common._arch_for(device))
-        for a, b in product(first, second):
-            key = (_TAG, a.tactic, b.tactic)
+        profiles = prepared.profiles(
+            "mxfp8_mxfp4",
+            tokens,
+            hidden,
+            intermediate,
+            experts,
+            topk,
+            first[0].activation,
+        )
+        for a, b, profile in product(first, second, profiles):
+            key = prepared.plan_key(_TAG, a, b, profile)
             plan = module.make_plan(
-                common._load_kernel(a, device),
-                common._load_kernel(b, device),
+                prepared.load(a, device, profile),
+                prepared.load(b, device, profile),
                 tokens,
                 hidden,
                 intermediate,
@@ -545,7 +555,19 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        profiles = prepared.profiles(
+            "mxfp8_mxfp4",
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            activation_name(self.config.activation),
+        )
+        tactics = [
+            prepared.plan_key(_TAG, a, b, profile)
+            for a, b, profile in product(first, second, profiles)
+        ]
         fma_tactic = _fma_tactic(
             tokens,
             hidden,

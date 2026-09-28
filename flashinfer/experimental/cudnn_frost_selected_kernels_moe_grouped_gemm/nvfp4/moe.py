@@ -20,6 +20,7 @@ from ....fused_moe.api import QuantFormat, RoutingInputMode
 from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
 from .. import runtime as common
+from .. import prepared
 from ..activations import ACTIVATIONS, activation_name
 from ..cache import (
     LRUCache,
@@ -42,7 +43,7 @@ _WEIGHT_KEYS = (
     "fc2_weight_block_scale",
     "fc2_dequant_scale",
 )
-_TAG = "cudnn_frost-nvfp4-moe-v3"
+_TAG = "cudnn_frost-nvfp4-moe-post5628-v3"
 
 
 def _tensor_version(tensor):
@@ -62,7 +63,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost NVFP4 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_nvfp4_moe_v2_{arch}",
+        f"cudnn_frost_nvfp4_moe_post5628_v3_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_nvfp4.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()
@@ -172,11 +173,16 @@ class _Plans:
         self.plans, self.launches = {}, {}
         required = 0
         module = _module(common._arch_for(device))
-        for a, b in product(first, second):
-            key = (_TAG, a.tactic, b.tactic)
+        profiles = prepared.profiles(
+            "nvfp4", tokens, hidden, intermediate, experts, topk, first[0].activation
+        )
+        for a, b, profile in product(first, second, profiles):
+            if not prepared.valid_pair(a, b, profile):
+                continue
+            key = prepared.plan_key(_TAG, a, b, profile)
             plan = module.make_plan(
-                common._load_kernel(a, device),
-                common._load_kernel(b, device),
+                prepared.load(a, device, profile),
+                prepared.load(b, device, profile),
                 tokens,
                 hidden,
                 intermediate,
@@ -192,6 +198,8 @@ class _Plans:
                 b.swap_ab,
                 swizzled,
                 False,
+                profile in ("input_fusion", "input_reuse"),
+                profile is not None and "swap_quant" in profile,
             )
             self.plans[key], self.launches[key] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
@@ -224,6 +232,8 @@ class _Plans:
                 False,
                 swizzled,
                 True,
+                False,
+                False,
             )
             self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
@@ -584,7 +594,20 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        profiles = prepared.profiles(
+            "nvfp4",
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            activation_name(self.config.activation),
+        )
+        tactics = [
+            prepared.plan_key(_TAG, a, b, profile)
+            for a, b, profile in product(first, second, profiles)
+            if prepared.valid_pair(a, b, profile)
+        ]
         fma_tactic = _fma_tactic(
             tokens,
             hidden,

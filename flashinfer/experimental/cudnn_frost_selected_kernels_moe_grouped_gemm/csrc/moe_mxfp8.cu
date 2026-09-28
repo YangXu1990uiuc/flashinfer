@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 
+#include "moe_finalize.cuh"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
@@ -30,6 +31,28 @@ __global__ void histogram(const int32_t* ids, int32_t* counts, int rows, int exp
     // ids are masked in gather/finalize, never used as memory addresses.
     atomicAdd(counts + (e >= 0 && e < experts ? e : 0), 1);
   }
+}
+
+__global__ void histogram_local(const int32_t* ids, int32_t* counts, int rows, int experts) {
+  if (experts > 128) {
+    for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < rows;
+         r += int64_t(blockDim.x) * gridDim.x) {
+      int e = ids[r];
+      atomicAdd(counts + (e >= 0 && e < experts ? e : 0), 1);
+    }
+    return;
+  }
+  __shared__ int local[128];
+  if (threadIdx.x < experts) local[threadIdx.x] = 0;
+  __syncthreads();
+  for (int64_t r = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; r < rows;
+       r += int64_t(blockDim.x) * gridDim.x) {
+    int e = ids[r];
+    atomicAdd(local + (e >= 0 && e < experts ? e : 0), 1);
+  }
+  __syncthreads();
+  if (threadIdx.x < experts && local[threadIdx.x])
+    atomicAdd(counts + threadIdx.x, local[threadIdx.x]);
 }
 
 template <bool SplitColumns = false>
@@ -67,6 +90,139 @@ __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const
   }
 }
 
+union alignas(16) Bf16x8 {
+  uint4 bits;
+  __nv_bfloat162 pairs[4];
+};
+
+template <int TOPK>
+__global__ __launch_bounds__(256, 2) void finalize_vec8(
+    const __nv_bfloat16* __restrict__ grouped, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ mapping, const float* __restrict__ scores, int expert_count,
+    __nv_bfloat16* __restrict__ output, int tokens, int hidden) {
+  constexpr int kThreads = 256;
+  constexpr int kElements = 8;
+  const int vectors_per_row = hidden / kElements;
+  const int tiles_per_row = (vectors_per_row + kThreads - 1) / kThreads;
+  const int tile = static_cast<int>(blockIdx.x);
+  const int token = tile / tiles_per_row;
+  const int vector = (tile - token * tiles_per_row) * kThreads + threadIdx.x;
+  if (token >= tokens || vector >= vectors_per_row) return;
+  const unsigned mask = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  float2 accum[4];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) accum[q] = make_float2(0.0f, 0.0f);
+#pragma unroll
+  for (int j = 0; j < TOPK; ++j) {
+    int expert = lane == j ? __ldg(ids + token * TOPK + j) : 0;
+    int row = lane == j ? __ldg(mapping + token * TOPK + j) : 0;
+    float weight = lane == j ? __ldg(scores + token * TOPK + j) : 0.0f;
+    expert = __shfl_sync(mask, expert, j);
+    row = __shfl_sync(mask, row, j);
+    weight = __shfl_sync(mask, weight, j);
+    if (expert >= 0 && expert < expert_count) {
+      Bf16x8 value;
+      value.bits =
+          reinterpret_cast<const uint4*>(grouped + static_cast<int64_t>(row) * hidden)[vector];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float2 x = __bfloat1622float2(value.pairs[q]);
+        accum[q].x = fmaf(x.x, weight, accum[q].x);
+        accum[q].y = fmaf(x.y, weight, accum[q].y);
+      }
+    }
+  }
+  Bf16x8 result;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) result.pairs[q] = __floats2bfloat162_rn(accum[q].x, accum[q].y);
+  reinterpret_cast<uint4*>(output + static_cast<int64_t>(token) * hidden)[vector] = result.bits;
+}
+
+#define VEC 8  // bf16 elements per 16B vector load
+
+__device__ __forceinline__ void accum_vec(float (&acc)[VEC], const uint4 r, const float w) {
+  const unsigned int u[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    // bf16 -> f32 is a pure bit shift, no rounding.
+    acc[2 * i + 0] = fmaf(__uint_as_float(u[i] << 16), w, acc[2 * i + 0]);
+    acc[2 * i + 1] = fmaf(__uint_as_float(u[i] & 0xffff0000u), w, acc[2 * i + 1]);
+  }
+}
+
+__device__ __forceinline__ uint4 pack_bf16(const float (&acc)[VEC]) {
+  uint4 o;
+  unsigned int* op = reinterpret_cast<unsigned int*>(&o);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    __nv_bfloat162 p = __floats2bfloat162_rn(acc[2 * i + 0], acc[2 * i + 1]);
+    op[i] = *reinterpret_cast<unsigned int*>(&p);
+  }
+  return o;
+}
+
+// Vectorized kernel: blockIdx.y = token, blockIdx.x tiles the hidden dim.
+// Each thread owns U independent 16B lanes so that U*K loads are in flight.
+template <int K, int U, int BD, bool SkipInvalid = false>
+__global__ void __launch_bounds__(BD)
+    finalize_vec_kernel(const __nv_bfloat16* __restrict__ grouped, const int* __restrict__ ids,
+                        const int* __restrict__ mapping, const float* __restrict__ scores,
+                        const int E, __nv_bfloat16* __restrict__ output, const int H,
+                        const int nvec) {
+  const int t = blockIdx.y;
+
+  const uint4* __restrict__ rows[K];
+  float w[K];
+  bool valid[K];
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    const int id = __ldg(ids + (size_t)t * K + j);
+    const int m = __ldg(mapping + (size_t)t * K + j);
+    valid[j] = id >= 0 && id < E;
+    w[j] = valid[j] ? __ldg(scores + (size_t)t * K + j) : 0.0f;
+    rows[j] = reinterpret_cast<const uint4*>(grouped + (size_t)(valid[j] ? m : 0) * H);
+  }
+  uint4* __restrict__ out = reinterpret_cast<uint4*>(output + (size_t)t * H);
+
+  const int v0 = blockIdx.x * (BD * U) + threadIdx.x;
+
+  if (v0 + (U - 1) * BD < nvec) {
+    uint4 raw[U][K];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+#pragma unroll
+      for (int j = 0; j < K; ++j)
+        raw[u][j] = valid[j] ? __ldg(rows[j] + (v0 + u * BD)) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      float acc[VEC];
+#pragma unroll
+      for (int i = 0; i < VEC; ++i) acc[i] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < K; ++j)
+        // Preserve the original tail path's signed-zero behavior when its
+        // work is covered by a full span in this bounded configuration.
+        if (!SkipInvalid || valid[j]) accum_vec(acc, raw[u][j], w[j]);
+      out[v0 + u * BD] = pack_bf16(acc);
+    }
+  } else {
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int v = v0 + u * BD;
+      if (v >= nvec) break;
+      float acc[VEC];
+#pragma unroll
+      for (int i = 0; i < VEC; ++i) acc[i] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < K; ++j)
+        if (valid[j]) accum_vec(acc, __ldg(rows[j] + v), w[j]);
+      out[v] = pack_bf16(acc);
+    }
+  }
+}
+
+#undef VEC
 void tensor(TensorView t, DLDevice device, DLDataType dtype, std::initializer_list<int64_t> shape,
             size_t alignment = 16) {
   TVM_FFI_ICHECK(t.device().device_type == kDLCUDA && t.device().device_id == device.device_id);
@@ -85,16 +241,307 @@ __device__ int64_t sf_index(int row, int col, int columns) {
 
 __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors,
                        int32_t* sf_offsets, int experts, float* scale) {
-  int start = 0, sf_start = 0;
-  for (int e = 0; e < experts; ++e) {
-    offsets[e] = cursors[e] = start;
-    sf_offsets[e] = sf_start;
-    start += counts[e];
-    sf_start += (counts[e] + 127) / 128 * 128;
+  if (experts > 128) {
+    if (threadIdx.x == 0) {
+      int start = 0, sf_start = 0;
+      for (int e = 0; e < experts; ++e) {
+        offsets[e] = cursors[e] = start;
+        sf_offsets[e] = sf_start;
+        start += counts[e];
+        sf_start += (counts[e] + 127) / 128 * 128;
+      }
+      scale[0] = 1.f;
+      scale[1] = 4.f;
+      scale[2] = 25.f;
+    }
+    return;
   }
-  scale[0] = 1.f;
-  scale[1] = 4.f;
-  scale[2] = 25.f;
+  __shared__ int warp_counts[4], warp_scales[4];
+  int e = threadIdx.x, lane = e % 32, warp = e / 32;
+  int count = e < experts ? counts[e] : 0;
+  int padded = (count + 127) / 128 * 128;
+  int sum = count, sf_sum = padded;
+#pragma unroll
+  for (int delta = 1; delta < 32; delta *= 2) {
+    int v = __shfl_up_sync(0xffffffff, sum, delta);
+    int sv = __shfl_up_sync(0xffffffff, sf_sum, delta);
+    if (lane >= delta) {
+      sum += v;
+      sf_sum += sv;
+    }
+  }
+  if (lane == 31) {
+    warp_counts[warp] = sum;
+    warp_scales[warp] = sf_sum;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int w = 0; w < 4; ++w)
+    if (w < warp) {
+      sum += warp_counts[w];
+      sf_sum += warp_scales[w];
+    }
+  if (e < experts) {
+    offsets[e] = cursors[e] = sum - count;
+    sf_offsets[e] = sf_sum - padded;
+  }
+  if (e == 0) {
+    scale[0] = 1.f;
+    scale[1] = 4.f;
+    scale[2] = 25.f;
+  }
+}
+
+template <bool Reserve>
+__global__ void assign_rows(const int32_t* ids, int32_t* cursors, int32_t* mapping,
+                            int32_t* row_experts, int rows, int experts, int32_t* inverse,
+                            int topk) {
+  const int64_t r = int64_t(blockIdx.x) * 256 + threadIdx.x;
+  const bool active = r < rows;
+  int e = active ? ids[r] : 0;
+  e = e >= 0 && e < experts ? e : 0;
+  int dest = 0;
+  if constexpr (Reserve) {
+    __shared__ int counts[128], starts[128];
+    if (threadIdx.x < 128) counts[threadIdx.x] = 0;
+    __syncthreads();
+    int rank = active ? atomicAdd(counts + e, 1) : 0;
+    __syncthreads();
+    if (threadIdx.x < experts && counts[threadIdx.x])
+      starts[threadIdx.x] = atomicAdd(cursors + threadIdx.x, counts[threadIdx.x]);
+    __syncthreads();
+    if (active) dest = starts[e] + rank;
+  } else {
+    if (active) dest = atomicAdd(cursors + e, 1);
+  }
+  if (active) {
+    mapping[r] = dest;
+    row_experts[dest] = e;
+    if (inverse) inverse[dest] = ids[r] >= 0 && ids[r] < experts ? r / topk : -1;
+  }
+}
+
+__device__ __forceinline__ uint4 ld_cs16(const uint4* p) {
+  uint4 v;
+  asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+__device__ __forceinline__ void st_cs16(uint4* p, const uint4& v) {
+  asm volatile("st.global.cs.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z),
+               "r"(v.w)
+               : "memory");
+}
+__device__ __forceinline__ uint32_t ld_nc32(const void* p) {
+  uint32_t v;
+  asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ uint4 ld_nc16(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel A: hidden-state gather (token-major, read-once) + inverse metadata.
+// blockDim.x == V (16B vectors per row);  each block owns TPB source tokens.
+// ---------------------------------------------------------------------------
+template <int V, int K, int C, int TILE, bool SWZ>
+__global__ __launch_bounds__(256) void gather_input_roles(
+    const uint4* __restrict__ xv, uint4* __restrict__ pv, const uint8_t* __restrict__ isf,
+    uint8_t* __restrict__ scales, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ mapping, const int32_t* __restrict__ invmeta,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ sf_offsets, int T, int R,
+    int E, int NS) {
+  constexpr int NMETA = (TILE * K > 128) ? TILE * K : 128;
+  __shared__ int32_t smem[NMETA];
+  const int tid = threadIdx.x;
+
+  if (blockIdx.x < (unsigned)NS) {
+    // ---------------- scale-tile role ----------------
+    constexpr int G = C / 4;
+    const int p = blockIdx.x;
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+      int mid = (lo + hi + 1) >> 1;
+      if ((__ldg(sf_offsets + mid) >> 7) <= p)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    const int e = lo;
+    const int off = __ldg(offsets + e);
+    const int cnt = ((e + 1 < E) ? __ldg(offsets + e + 1) : R) - off;
+    const int b = p - (__ldg(sf_offsets + e) >> 7);
+    if (b * 128 >= cnt) return;
+
+    const int base_d = off + b * 128;
+    uint8_t* out = scales + (size_t)(__ldg(sf_offsets + e) + b * 128) * C;
+
+    if (tid < 128) {
+      int d = base_d + tid;
+      int t = (d < R) ? __ldg(invmeta + d) : -1;
+      int sb = -1;
+      if (t >= 0) {
+        if constexpr (SWZ)
+          sb = (t >> 7) * 128 * C + (t & 31) * 16 + ((t & 127) >> 5) * 4;
+        else
+          sb = t * C;
+      }
+      smem[tid] = sb;
+    }
+    __syncthreads();
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    int sb0 = smem[lane], sb1 = smem[lane + 32];
+    int sb2 = smem[lane + 64], sb3 = smem[lane + 96];
+
+    if constexpr (SWZ) {
+      constexpr int gs = (G + 7) / 8;
+      int g0 = warp * gs, g1 = min(G, g0 + gs);
+      for (int g = g0; g < g1; ++g) {
+        const int o = g * 512;
+        uint4 r;
+        r.x = (sb0 >= 0) ? ld_nc32(isf + sb0 + o) : 0x7f7f7f7fu;
+        r.y = (sb1 >= 0) ? ld_nc32(isf + sb1 + o) : 0x7f7f7f7fu;
+        r.z = (sb2 >= 0) ? ld_nc32(isf + sb2 + o) : 0x7f7f7f7fu;
+        r.w = (sb3 >= 0) ? ld_nc32(isf + sb3 + o) : 0x7f7f7f7fu;
+        st_cs16((uint4*)(out + o + lane * 16), r);
+      }
+    } else {
+      constexpr int Gq = G >> 2;
+      constexpr int gs = (Gq + 7) / 8;
+      int q0 = warp * gs, q1 = min(Gq, q0 + gs);
+      const uint4 zero = make_uint4(0x7f7f7f7fu, 0x7f7f7f7fu, 0x7f7f7f7fu, 0x7f7f7f7fu);
+      for (int q = q0; q < q1; ++q) {
+        const int o16 = q * 16;
+        uint4 a = (sb0 >= 0) ? ld_nc16(isf + sb0 + o16) : zero;
+        uint4 bb = (sb1 >= 0) ? ld_nc16(isf + sb1 + o16) : zero;
+        uint4 c = (sb2 >= 0) ? ld_nc16(isf + sb2 + o16) : zero;
+        uint4 dd = (sb3 >= 0) ? ld_nc16(isf + sb3 + o16) : zero;
+        uint8_t* ob = out + q * 2048 + lane * 16;
+        st_cs16((uint4*)(ob), make_uint4(a.x, bb.x, c.x, dd.x));
+        st_cs16((uint4*)(ob + 512), make_uint4(a.y, bb.y, c.y, dd.y));
+        st_cs16((uint4*)(ob + 1024), make_uint4(a.z, bb.z, c.z, dd.z));
+        st_cs16((uint4*)(ob + 1536), make_uint4(a.w, bb.w, c.w, dd.w));
+      }
+    }
+    return;
+  }
+
+  // ---------------- hidden-state gather role ----------------
+  constexpr int ILP = TILE * V / 256;
+  const int tok0 = (blockIdx.x - NS) * TILE;
+
+  for (int i = tid; i < TILE * K; i += 256) {
+    int n = i / K;
+    int t = tok0 + n;
+    int v = 0x80000000;
+    if (t < T) {
+      int r = t * K + (i - n * K);
+      int id = __ldg(ids + r);
+      int d = __ldg(mapping + r);
+      v = ((unsigned)id < (unsigned)E) ? d : ~d;
+    }
+    smem[i] = v;
+  }
+
+  uint4 val[ILP];
+#pragma unroll
+  for (int u = 0; u < ILP; ++u) {
+    int L = u * 256 + tid;
+    int n = L / V;
+    int t = tok0 + n;
+    if (t < T) val[u] = ld_cs16(xv + (size_t)t * V + (L - n * V));
+  }
+  __syncthreads();
+
+  const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+  for (int u = 0; u < ILP; ++u) {
+    int L = u * 256 + tid;
+    int n = L / V;
+    int t = tok0 + n;
+    if (t >= T) continue;
+    const int v = L - n * V;
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      int enc = smem[n * K + j];
+      bool ok = enc >= 0;
+      int d = ok ? enc : ~enc;
+      st_cs16(pv + (size_t)d * V + v, ok ? val[u] : zero);
+    }
+  }
+}
+
+template <int V, int K, int C, int TILE, bool SWZ>
+static void launch_roles_specialized(const void* x, void* packed, const uint8_t* isf,
+                                     uint8_t* scales, const int32_t* ids, const int32_t* mapping,
+                                     const int32_t* invmeta, const int32_t* offsets,
+                                     const int32_t* sf_offsets, int T, int R, int E, int NS,
+                                     cudaStream_t s) {
+  int grid = NS + (T + TILE - 1) / TILE;
+  gather_input_roles<V, K, C, TILE, SWZ><<<grid, 256, 0, s>>>((const uint4*)x, (uint4*)packed, isf,
+                                                              scales, ids, mapping, invmeta,
+                                                              offsets, sf_offsets, T, R, E, NS);
+}
+
+void launch_input_roles(const void* x, void* packed, const uint8_t* isf, uint8_t* scales,
+                        const int32_t* ids, const int32_t* mapping, const int32_t* invmeta,
+                        const int32_t* offsets, const int32_t* sf_offsets, int T, int V, int R,
+                        int E, int K, int C, int NS, bool swizzled, cudaStream_t s) {
+#define GO(VV, KK, CC, TT)                                                                     \
+  do {                                                                                         \
+    if (swizzled)                                                                              \
+      launch_roles_specialized<VV, KK, CC, TT, true>(                                          \
+          x, packed, isf, scales, ids, mapping, invmeta, offsets, sf_offsets, T, R, E, NS, s); \
+    else                                                                                       \
+      launch_roles_specialized<VV, KK, CC, TT, false>(                                         \
+          x, packed, isf, scales, ids, mapping, invmeta, offsets, sf_offsets, T, R, E, NS, s); \
+  } while (0)
+  if (V == 128 && K == 6)
+    GO(128, 6, 64, 8);
+  else
+    GO(448, 2, 224, 4);
+#undef GO
+}
+
+template <bool PackedScale>
+__global__ void gather_copy(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
+                            const int32_t* offsets, const int32_t* sf_offsets,
+                            const int32_t* mapping, uint8_t* grouped, uint8_t* sf, int rows,
+                            int hidden, int topk, int experts, bool swizzled) {
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  for (int64_t r = int64_t(blockIdx.x) * 4 + warp; r < rows; r += int64_t(gridDim.x) * 4) {
+    int e = ids[r];
+    bool valid = e >= 0 && e < experts;
+    e = valid ? e : 0;
+    const int dest = __ldg(mapping + r);
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 16);
+    for (int h = lane; h < hidden / 16; h += 32)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
+    const int cols = hidden / 32;
+    if constexpr (PackedScale) {
+      for (int col = lane * 4; col < cols; col += 128) {
+        int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
+        int64_t dst = int64_t(sf_offsets[e]) * cols + sf_index(dest - offsets[e], col, cols);
+        *reinterpret_cast<uint32_t*>(sf + dst) =
+            valid ? *reinterpret_cast<const uint32_t*>(input_sf + src) : 0x7f7f7f7fu;
+      }
+    } else {
+      for (int col = lane; col < cols; col += 32) {
+        int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
+        int64_t dst = int64_t(sf_offsets[e]) * cols + sf_index(dest - offsets[e], col, cols);
+        sf[dst] = valid ? input_sf[src] : 127;
+      }
+    }
+  }
 }
 
 __global__ void gather(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
@@ -126,8 +573,106 @@ __global__ void gather(const uint8_t* x, const uint8_t* input_sf, const int32_t*
   }
 }
 
+__global__ void gather_warp(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
+                            const int32_t* offsets, const int32_t* sf_offsets, int32_t* cursors,
+                            int32_t* mapping, int32_t* row_experts, uint8_t* grouped, uint8_t* sf,
+                            int rows, int hidden, int topk, int experts, bool swizzled) {
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  for (int64_t r = int64_t(blockIdx.x) * 4 + warp; r < rows; r += int64_t(gridDim.x) * 4) {
+    int e = ids[r];
+    bool valid = e >= 0 && e < experts;
+    e = valid ? e : 0;
+    int dest = 0;
+    if (lane == 0) {
+      dest = atomicAdd(cursors + e, 1);
+      mapping[r] = dest;
+      row_experts[dest] = e;
+    }
+    dest = __shfl_sync(0xffffffff, dest, 0);
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 16);
+    for (int h = lane; h < hidden / 16; h += 32)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
+    int cols = hidden / 32;
+    for (int col = lane; col < cols; col += 32) {
+      int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
+      int64_t dst = int64_t(sf_offsets[e]) * cols + sf_index(dest - offsets[e], col, cols);
+      sf[dst] = valid ? input_sf[src] : 127;
+    }
+  }
+}
+
 // Small batches compute stable routing and expert-local scale segments per CTA.
 // No CTA consumes metadata written by another CTA in this launch.
+// At most eight expanded rows: derive offsets from the row list in registers.
+// Every CTA is independent, and invalid IDs retain expert-zero dummy storage.
+__global__ void route_tiny(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
+                           int32_t* offsets, int32_t* sf_offsets, int32_t* mapping,
+                           int32_t* row_experts, uint8_t* grouped, uint8_t* sf, float* scale,
+                           int rows, int hidden, int topk, int experts, bool swizzled) {
+  const int r = blockIdx.x, lane = threadIdx.x % 32;
+  const bool active = r < rows;
+  int dest = 0, begin = 0, sfbegin = 0, expert = 0, valid = 0;
+  if (lane == 0) {
+    int es[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int value = j < rows ? ids[j] : 0;
+      es[j] = value >= 0 && value < experts ? value : 0;
+    }
+    if (active) {
+      const int value = ids[r];
+      valid = value >= 0 && value < experts;
+      expert = es[r];
+    }
+    int off = 0, sfoff = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      if (j < rows) {
+        bool first = true;
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+          if (q < j && es[q] == es[j]) first = false;
+        off += es[j] < r;
+        sfoff += (es[j] < r && first) * 128;
+        begin += es[j] < expert;
+        sfbegin += (es[j] < expert && first) * 128;
+        dest += es[j] < expert || (es[j] == expert && j < r);
+      }
+    if (threadIdx.x == 0) {
+      if (r < experts) {
+        offsets[r] = off;
+        sf_offsets[r] = sfoff;
+      }
+      if (active) {
+        mapping[r] = dest;
+        row_experts[dest] = expert;
+      }
+      if (r == 0) {
+        scale[0] = 1.f;
+        scale[1] = 4.f;
+        scale[2] = 25.f;
+      }
+    }
+  }
+  dest = __shfl_sync(0xffffffff, dest, 0);
+  begin = __shfl_sync(0xffffffff, begin, 0);
+  sfbegin = __shfl_sync(0xffffffff, sfbegin, 0);
+  valid = __shfl_sync(0xffffffff, valid, 0);
+  if (active) {
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 16);
+    for (int h = threadIdx.x; h < hidden / 16; h += blockDim.x)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
+    const int cols = hidden / 32;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+      const int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
+      const int64_t dst = int64_t(sfbegin) * cols + sf_index(dest - begin, col, cols);
+      sf[dst] = valid ? input_sf[src] : 127;
+    }
+  }
+}
+
 __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
                             int32_t* offsets, int32_t* sf_offsets, int32_t* mapping,
                             int32_t* row_experts, uint8_t* grouped, uint8_t* sf, float* scale,
@@ -254,6 +799,61 @@ __global__ void requantize(const __nv_bfloat16* input, const int32_t* row_expert
   }
 }
 
+template <bool SplitColumns = false>
+__global__ void requantize_warp(const __nv_bfloat16* input, const int32_t* row_experts,
+                                const int32_t* offsets, const int32_t* sf_offsets, uint8_t* output,
+                                uint8_t* scales, int rows, int width) {
+  union InputPack {
+    int4 words;
+    __nv_bfloat16 values[8];
+  };
+  union OutputPack {
+    uint64_t words;
+    uint8_t values[8];
+  };
+  // Column tiles contain whole 32-element blocks, preserving lane reductions
+  // and the original quantization rounding for small batches.
+  const int tiles = 1;
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  for (int64_t task = int64_t(blockIdx.x) * 4 + warp; task < int64_t(rows);
+       task += int64_t(gridDim.x) * 4) {
+    const int64_t row = task / tiles;
+    const int part = task % tiles;
+    int e = row_experts[row];
+    for (int col = lane * 8; col < width; col += 32 * 8) {
+      InputPack in;
+      in.words = reinterpret_cast<const int4*>(input)[(row * width + col) / 8];
+      float values[8], maximum = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        values[j] = __bfloat162float(in.values[j]);
+        maximum = fmaxf(maximum, fabsf(values[j]));
+      }
+      // Four adjacent lanes own one 32-element microscaling block.
+      auto mask = __activemask();
+      maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 1));
+      maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 2));
+      __nv_fp8_e8m0 sf;
+      sf.__x = __nv_cvt_float_to_e8m0(multiply_no_ftz(maximum, 1.f / 448.f), __NV_SATFINITE,
+                                      cudaRoundPosInf);
+      // Reciprocal of 2^(byte-127), including byte 254 (2^-127) and NaN.
+      uint32_t inverse_bits = (254u - sf.__x) << 23;
+      if (sf.__x >= 254) inverse_bits |= 1u << 22;
+      float inverse = __uint_as_float(inverse_bits);
+      if (threadIdx.x % 4 == 0) {
+        int cols = width / 32;
+        scales[int64_t(sf_offsets[e]) * cols + sf_index(row - offsets[e], col / 32, cols)] = sf.__x;
+      }
+      OutputPack out;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        out.values[j] =
+            __nv_cvt_float_to_fp8(multiply_no_ftz(values[j], inverse), __NV_SATFINITE, __NV_E4M3);
+      reinterpret_cast<uint64_t*>(output)[(row * width + col) / 8] = out.words;
+    }
+  }
+}
+
 class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
  public:
   CudnnFrostMxfp8MoePlan(Function fc1, Function fc2, int64_t tokens, int64_t hidden,
@@ -334,6 +934,8 @@ class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
 
   const char* kind() const final { return "cudnn_frost_mxfp8_moe_plan"; }
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
+    if (name == "finalize_variant")
+      return Function::FromTyped([this]() { return finalize_variant(); });
     if (name == "workspace_size")
       return Function::FromTyped([this]() { return int64_t(workspace_size_); });
     if (name == "stage_layout")
@@ -360,6 +962,16 @@ class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
   }
 
  private:
+  int64_t finalize_variant() const {
+    if (frost_moe_finalize::small_supported(t_, h_, i_, e_, k_)) return 1;
+    if (frost_moe_finalize::shape_supported(t_, h_, i_, e_, k_)) return 2;
+    return 0;
+  }
+  bool use_roles_input() const {
+    return s_ >= 8192 && t_ <= 12288 &&
+           ((e_ == 64 && h_ == 2048 && i_ == 1408 && k_ == 6) ||
+            (e_ == 12 && h_ == 7168 && i_ == 3072 && k_ == 2));
+  }
   void run(TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
            TensorView w2, TensorView sf1, TensorView sf2, TensorView xsf, TensorView workspace,
            bool stages) const {
@@ -411,19 +1023,49 @@ class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
     auto scale = reinterpret_cast<float*>(base + scale_pos_);
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    if (s_ <= 512 && e_ <= 256) {
+    if (s_ <= 8 && e_ == 64) {
+      route_tiny<<<std::max(s_, e_), 128, 0, stream>>>(
+          static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
+          expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
+          swizzled_);
+    } else if (s_ <= 512 && e_ <= 256) {
       route_small<<<std::max(s_, e_), 128, 0, stream>>>(
           static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
           expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
           swizzled_);
     } else {
       checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
-                                                                               s_, e_);
-      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
-      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-          static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
-          offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+      if (s_ >= 16384 && e_ >= 32) {
+        histogram_local<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(
+            expert_ids, counts, s_, e_);
+      } else {
+        histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                                 s_, e_);
+      }
+      prefix<<<1, 128, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
+      if (use_roles_input()) {
+        // The quantized output buffer is unused until FC1, including fused FC1.
+        auto inverse = reinterpret_cast<int32_t*>(qm);
+        assign_rows<true><<<(s_ + 255) / 256, 256, 0, stream>>>(expert_ids, cursors, mapping,
+                                                                row_experts, s_, e_, inverse, k_);
+        launch_input_roles(x.data_ptr(), gx, static_cast<const uint8_t*>(xsf.data_ptr()), sfx,
+                           expert_ids, mapping, inverse, offsets, sf_offsets, t_, h_ / 16, s_, e_,
+                           k_, h_ / 32, (s_ + 127) / 128 + e_, swizzled_, stream);
+      } else if (s_ >= 8192 && e_ >= 32 && e_ <= 128) {
+        assign_rows<true><<<(s_ + 255) / 256, 256, 0, stream>>>(expert_ids, cursors, mapping,
+                                                                row_experts, s_, e_, nullptr, k_);
+        gather_copy<true><<<std::min<int64_t>((s_ + 3) / 4, 4096), 128, 0, stream>>>(
+            static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
+            offsets, sf_offsets, mapping, gx, sfx, s_, h_, k_, e_, swizzled_);
+      } else if (s_ >= 8192) {
+        gather_warp<<<std::min<int64_t>((s_ + 3) / 4, 4096), 128, 0, stream>>>(
+            static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
+            offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+      } else {
+        gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+            static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
+            offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+      }
     }
     checked(cudaGetLastError());
 
@@ -494,8 +1136,13 @@ class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
         requantize<true><<<std::min<int64_t>(s_ * ((i_ + 1023) / 1024), 4096), 128, 0, stream>>>(
             mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
       } else {
-        requantize<false><<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-            mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
+        if (s_ >= 8192) {
+          requantize_warp<false><<<std::min<int64_t>((s_ + 3) / 4, 4096), 128, 0, stream>>>(
+              mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
+        } else {
+          requantize<false><<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+              mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
+        }
       }
     }
     checked(cudaGetLastError());
@@ -505,7 +1152,54 @@ class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
          TensorView(swap2_ ? &tqm : &down), TensorView(swap2_ ? &sf_down : &sf_mid),
          TensorView(swap2_ ? &sf_mid : &sf_down), TensorView(swap2_ ? &ty_sw : &ty),
          static_cast<void*>(stream));
-    if (t_ <= 8) {
+    const auto finalize_path = finalize_variant();
+    if (finalize_path == 1) {
+      frost_moe_finalize::launch_small(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, e_, k_, stream);
+    } else if (finalize_path == 2) {
+      const int vectors = h_ / 8;
+      dim3 grid((vectors + 511) / 512, t_);
+      finalize_vec_kernel<2, 4, 128, true><<<grid, 128, 0, stream>>>(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+          static_cast<__nv_bfloat16*>(out.data_ptr()), h_, vectors);
+    } else if (t_ > 8 && t_ <= 512 && (k_ == 2 || k_ == 6) && h_ % 256 == 0) {
+      const int grid = t_ * ((h_ / 8 + 255) / 256);
+      if (k_ == 2) {
+        finalize_vec8<2><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_);
+      } else {
+        finalize_vec8<6><<<grid, 256, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_);
+      }
+    } else if (t_ > 512 && t_ <= 65535 && (k_ == 2 || k_ == 6) && h_ % 256 == 0) {
+      const int vectors = h_ / 8;
+      if (k_ == 2) {
+        dim3 grid((vectors + 895) / 896, t_);
+        finalize_vec_kernel<2, 7, 128><<<grid, 128, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, vectors);
+      } else {
+        dim3 grid((vectors + 255) / 256, t_);
+        finalize_vec_kernel<6, 2, 128><<<grid, 128, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, vectors);
+      }
+    } else if (t_ <= 8 && (k_ == 2 || k_ == 6) && h_ % 128 == 0) {
+      if (k_ == 2) {
+        dim3 grid((h_ / 8 + 63) / 64, t_);
+        finalize_vec_kernel<2, 1, 64><<<grid, 64, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, h_ / 8);
+      } else {
+        dim3 grid((h_ / 8 + 31) / 32, t_);
+        finalize_vec_kernel<6, 1, 32><<<grid, 32, 0, stream>>>(
+            gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()), e_,
+            static_cast<__nv_bfloat16*>(out.data_ptr()), h_, h_ / 8);
+      }
+    } else if (t_ <= 8) {
       finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
           static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);

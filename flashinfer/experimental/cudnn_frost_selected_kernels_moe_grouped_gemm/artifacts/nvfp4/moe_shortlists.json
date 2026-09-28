@@ -6799,6 +6799,57 @@
       "intermediate": 1408,
       "tokens": 12288,
       "top_k": 6
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 2048,
+      "intermediate": 768,
+      "top_k": 8,
+      "tokens": 8,
+      "fc1": [
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_tma",
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_stg"
+      ],
+      "fc2": [
+        "block_scale_grouped_gemm2_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_stg",
+        "block_scale_grouped_gemm2_sm_107a_256x128x128_128x128x64_cluster2x1_2ctamma_swapAB_clc_tma"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 2048,
+      "intermediate": 768,
+      "top_k": 8,
+      "tokens": 256,
+      "fc1": [
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_stg",
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_tma"
+      ],
+      "fc2": [
+        "block_scale_grouped_gemm2_sm_107a_128x256x128_128x256x64_cluster1x1_1ctamma_clc_stg",
+        "block_scale_grouped_gemm2_sm_107a_512x128x128_128x128x64_cluster2x1_2ctamma_swapAB_clc_tma"
+      ]
+    },
+    {
+      "arch": "sm_107a",
+      "activation": "swiglu",
+      "experts": 128,
+      "hidden": 2048,
+      "intermediate": 768,
+      "top_k": 8,
+      "tokens": 8192,
+      "fc1": [
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster2x1_2ctamma_clc_stg",
+        "block_scale_grouped_gemm1_swiglu_sm_107a_128x256x128_128x256x64_cluster2x1_2ctamma_clc_tma"
+      ],
+      "fc2": [
+        "block_scale_grouped_gemm2_sm_107a_256x256x128_128x256x64_cluster2x1_2ctamma_swapAB_clc_tma",
+        "block_scale_grouped_gemm2_sm_107a_256x256x128_128x256x64_cluster2x1_2ctamma_clc_tma"
+      ]
     }
   ],
   "version": 1
