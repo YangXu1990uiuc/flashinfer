@@ -126,12 +126,8 @@ def profiles(dtype, tokens, hidden, intermediate, experts, topk, activation):
             else (None, "static_absolute_all_v3")
         )
     if dtype == "nvfp4":
-        if geometry == (128, 2048, 768, 8) and 8192 <= tokens <= 12288:
-            return (
-                (None, "input_fusion", "input_reuse")
-                if tokens >= 9216
-                else (None, "input_fusion")
-            )
+        # Input fusion/reuse remain research-only until sanitizer qualification.
+        # Normal tuning must not select them merely because numerical tests pass.
         if tokens <= 512 and (
             primary or geometry in ((128, 2048, 768, 8), (8, 4096, 14336, 2))
         ):
@@ -147,6 +143,20 @@ def profiles(dtype, tokens, hidden, intermediate, experts, topk, activation):
         if primary and 8192 <= tokens <= 12288:
             return (None, "absolute")
     return (None,)
+
+
+def research_input_profiles(
+    dtype, tokens, hidden, intermediate, experts, topk, activation
+):
+    """Explicit diagnostic choices, intentionally absent from normal enumeration."""
+    if (
+        dtype == "nvfp4"
+        and activation == "swiglu"
+        and (experts, hidden, intermediate, topk) == (128, 2048, 768, 8)
+        and 8192 <= tokens <= 12288
+    ):
+        return ("input_fusion", "input_reuse") if tokens >= 9216 else ("input_fusion",)
+    return ()
 
 
 @functools.cache

@@ -3422,14 +3422,30 @@ def test_model_geometry_native_routes(dtype, tokens, geometry, monkeypatch):
 @pytest.mark.parametrize("swizzled", [False, True])
 def test_nvfp4_additional_model_geometry(tokens, swizzled, monkeypatch):
     _assert_model_geometry_native_routes(
-        "nvfp4", tokens, (128, 2048, 768, 8), monkeypatch, swizzled=swizzled
+        "nvfp4",
+        tokens,
+        (128, 2048, 768, 8),
+        monkeypatch,
+        swizzled=swizzled,
+        research_inputs=tokens >= 8192,
     )
 
 
 def _assert_model_geometry_native_routes(
-    dtype, tokens, geometry, monkeypatch, swizzled=False
+    dtype, tokens, geometry, monkeypatch, swizzled=False, research_inputs=False
 ):
     from flashinfer import fused_moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        prepared,
+    )
+
+    if research_inputs:
+        ordinary = prepared.profiles
+        monkeypatch.setattr(
+            prepared,
+            "profiles",
+            lambda *args: ordinary(*args) + prepared.research_input_profiles(*args),
+        )
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
@@ -3501,7 +3517,7 @@ def _assert_model_geometry_native_routes(
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
     assert len(tactics) >= 4
-    if dtype == "nvfp4" and experts == 128 and tokens >= 8192:
+    if research_inputs:
         fused = [
             tactic
             for tactic in tactics
@@ -3614,3 +3630,14 @@ def test_prepared_profile_tactics_track_compiler_changes(monkeypatch):
     assert prepared.plan_key("tag", first, second, None) == original
     current[0] = "bundled"
     assert prepared.plan_key("tag", first, second, "absolute") == before
+
+
+def test_unqualified_input_profiles_are_excluded_from_normal_tuning():
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        prepared,
+    )
+
+    for tokens in (8192, 9216, 12288):
+        args = ("nvfp4", tokens, 2048, 768, 128, 8, "swiglu")
+        assert prepared.profiles(*args) == (None,)
+        assert prepared.research_input_profiles(*args)
