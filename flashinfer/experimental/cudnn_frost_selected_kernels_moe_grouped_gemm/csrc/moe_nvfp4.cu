@@ -1177,6 +1177,7 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
 
  private:
   int64_t finalize_variant() const {
+    if (frost_moe_finalize::large_supported(t_, h_, i_, e_, k_)) return 3;
     if (frost_moe_finalize::small_supported(t_, h_, i_, e_, k_)) return 1;
     if (frost_moe_finalize::shape_supported(t_, h_, i_, e_, k_)) return 2;
     return 0;
@@ -1459,7 +1460,11 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     args[argc++] = static_cast<void*>(stream);
     fc2_.CallPacked(args, argc, &result);
     const auto finalize_path = finalize_variant();
-    if (finalize_path == 1) {
+    if (finalize_path == 3) {
+      frost_moe_finalize::launch_large(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, e_, k_, stream);
+    } else if (finalize_path == 1) {
       frost_moe_finalize::launch_small(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
           static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, e_, k_, stream);

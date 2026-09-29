@@ -2508,14 +2508,23 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
 
 @supported_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
-@pytest.mark.parametrize("store", ["stg", "tma"])
+@pytest.mark.parametrize(
+    "store,prepared_output", [("stg", False), ("tma", False), ("stg", True)]
+)
 def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
-    tokens, store, monkeypatch
+    tokens, store, prepared_output, monkeypatch
 ):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
         moe,
     )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
+
+    if prepared_output:
+        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+            prepared,
+        )
+
+        monkeypatch.setattr(prepared, "profiles", lambda *args: (None, "output_store"))
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
@@ -2566,7 +2575,15 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    baseline_tactic = next(
+        t for t in tactics if t[1] == original.tactic and len(t) == 3
+    )
+    fused_tactic = next(
+        t
+        for t in tactics
+        if t[1] == fused.tactic
+        and (("output_store" in t) if prepared_output else len(t) == 3)
+    )
     plans = inputs.launch_state.plans
     assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
         "workspace_size"
@@ -3641,3 +3658,13 @@ def test_unqualified_input_profiles_are_excluded_from_normal_tuning():
         args = ("nvfp4", tokens, 2048, 768, 128, 8, "swiglu")
         assert prepared.profiles(*args) == (None,)
         assert prepared.research_input_profiles(*args)
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [8191, 8192, 8193, 12288])
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (128, 2048, 768, 8)])
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_nvfp4_prefill_routes_and_replay(tokens, geometry, swizzled, monkeypatch):
+    _assert_model_geometry_native_routes(
+        "nvfp4", tokens, geometry, monkeypatch, swizzled=swizzled
+    )

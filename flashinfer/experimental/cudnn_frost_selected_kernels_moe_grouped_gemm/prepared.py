@@ -141,7 +141,11 @@ def profiles(dtype, tokens, hidden, intermediate, experts, topk, activation):
                 else (None, "static_general_plain_absolute")
             )
         if primary and 8192 <= tokens <= 12288:
-            return (None, "absolute")
+            return (
+                (None, "absolute", "absolute_output_store")
+                if geometry == (64, 2048, 1408, 6)
+                else (None, "absolute")
+            )
     return (None,)
 
 
@@ -168,6 +172,7 @@ def _source_identity():
             "nvfp4/input_source.py",
             "nvfp4/reuse_source.py",
             "nvfp4/swap_fused_quant.py",
+            "nvfp4/output_source.py",
         )
     )
 
@@ -201,6 +206,13 @@ def load(kernel, device, profile):
     path, digest = make_source(
         kernel, FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles", profile
     )
+    if "output_store" in profile and kernel.fc1:
+        from .nvfp4.output_source import make_source as output_source
+
+        path, digest = output_source(
+            SimpleNamespace(source_path=path),
+            FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles",
+        )
     if "swap_quant" in profile and kernel.fc1:
         from .nvfp4.swap_fused_quant import make_source as swap_source
 
@@ -213,6 +225,12 @@ def load(kernel, device, profile):
 
 
 def valid_pair(first, second, profile):
+    if profile is not None and "output_store" in profile:
+        return (
+            not first.swap_ab
+            and "output_scale" in first.launch_tail
+            and first.tactic_metadata.get("store_mode") == "stg"
+        )
     if profile is not None and "swap_quant" in profile:
         return (
             first.swap_ab

@@ -136,6 +136,70 @@ __global__ __launch_bounds__(128) void prefetch_k2_kernel(const __nv_bfloat16* _
   }
 }
 
+template <int K>
+__global__ __launch_bounds__(128) void prefetch_dense2048_kernel(
+    const __nv_bfloat16* __restrict__ grouped, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ mapping, const float* __restrict__ scores,
+    __nv_bfloat16* __restrict__ output, int experts) {
+  const int token = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  int expert = -1, row = 0;
+  float weight = 0.0f;
+  if (lane < K) {
+    const int r = token * K + lane;
+    expert = ids[r];
+    if (static_cast<unsigned>(expert) < static_cast<unsigned>(experts)) {
+      row = mapping[r];
+      weight = scores[r];
+    }
+  }
+  const unsigned valid =
+      __ballot_sync(0xffffffffu, static_cast<unsigned>(expert) < static_cast<unsigned>(experts));
+  uint4 values[2][K];
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    const int source_row = __shfl_sync(0xffffffffu, row, j);
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      values[u][j] = make_uint4(0, 0, 0, 0);
+      if ((valid >> j) & 1u) {
+        const uint4* source = reinterpret_cast<const uint4*>(grouped) +
+                              static_cast<int64_t>(source_row) * 256 + threadIdx.x + u * 128;
+        values[u][j] = __ldcs(source);
+      }
+    }
+  }
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    float acc[8] = {};
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      const float w = __shfl_sync(0xffffffffu, weight, j);
+      // Match the existing full-span path, including zero-valued invalid slots.
+      ordered_fma8(acc, values[u][j], w);
+    }
+    reinterpret_cast<uint4*>(output)[static_cast<int64_t>(token) * 256 + threadIdx.x + u * 128] =
+        pack_bf16_8(acc);
+  }
+}
+
+inline bool large_supported(int64_t t, int64_t h, int64_t i, int64_t e, int64_t k) {
+  return t >= 8192 && t <= 12288 && h == 2048 &&
+         ((e == 64 && i == 1408 && k == 6) || (t == 8192 && e == 128 && i == 768 && k == 8));
+}
+
+inline void launch_large(const __nv_bfloat16* grouped, const int32_t* ids, const int32_t* mapping,
+                         const float* scores, __nv_bfloat16* output, int tokens, int experts,
+                         int topk, cudaStream_t stream) {
+  if (topk == 6) {
+    prefetch_dense2048_kernel<6>
+        <<<tokens, 128, 0, stream>>>(grouped, ids, mapping, scores, output, experts);
+  } else {
+    prefetch_dense2048_kernel<8>
+        <<<tokens, 128, 0, stream>>>(grouped, ids, mapping, scores, output, experts);
+  }
+}
+
 inline bool measured_geometry(int64_t h, int64_t i, int64_t e, int64_t k) {
   return (e == 64 && h == 2048 && i == 1408 && k == 6) ||
          (e == 12 && h == 7168 && i == 3072 && k == 2) ||
