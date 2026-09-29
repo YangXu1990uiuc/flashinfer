@@ -2509,10 +2509,11 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
 @supported_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize(
-    "store,prepared_output", [("stg", False), ("tma", False), ("stg", True)]
+    "store,prepared_output",
+    [("stg", None), ("tma", None), ("stg", "output_store"), ("stg", "output_wide")],
 )
 def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
-    tokens, store, prepared_output, monkeypatch
+    tokens, store, prepared_output, monkeypatch, geometry=(8, 256, 256, 2)
 ):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
         moe,
@@ -2524,12 +2525,12 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
             prepared,
         )
 
-        monkeypatch.setattr(prepared, "profiles", lambda *args: (None, "output_store"))
+        monkeypatch.setattr(prepared, "profiles", lambda *args: (None, prepared_output))
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.manual_seed(131)
-    h, i, e, k = 256, 256, 8, 2
+    e, h, i, k = geometry
     activation = SwiGLU()
     quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
     config = replace(
@@ -2559,7 +2560,16 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         tokens * k, h, i, e, xq.device, activation, quantized_output=True
     )
     fused = next(
-        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+        kernel
+        for kernel in fused
+        if kernel.tactic_metadata["store_mode"] == store
+        and (
+            not (prepared_output and prepared_output.endswith("output_wide"))
+            or (
+                kernel.tactic_metadata.get("cta_group") == 2
+                and kernel.tactic_metadata["cta_tile"]["n"] == 256
+            )
+        )
     )
     original = next(
         kernel
@@ -2582,7 +2592,7 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         t
         for t in tactics
         if t[1] == fused.tactic
-        and (("output_store" in t) if prepared_output else len(t) == 3)
+        and ((prepared_output in t) if prepared_output else len(t) == 3)
     )
     plans = inputs.launch_state.plans
     assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
@@ -2622,12 +2632,43 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
                 unpacked[begin:end] = stage["fc2_token_scales"][index]
                 sf_start += (end - begin + 127) // 128 * 128
             logical_sf.append(unpacked)
+        # Physical grouped rows can be permuted independently between calls.
+        # Match input rows within each expert before comparing intermediates.
+        # Check the full input bytes so a prefix-key collision cannot hide a mismatch.
+        orders = []
+        starts = baseline["offsets"].tolist() + [rows]
+        for stage in (baseline, actual):
+            parts = []
+            for begin, end in zip(starts, starts[1:], strict=False):
+                key = (
+                    stage["fc1_tokens"][begin:end, :8]
+                    .contiguous()
+                    .view(torch.int64)
+                    .flatten()
+                )
+                parts.append(key.argsort(stable=True) + begin)
+            orders.append(torch.cat(parts))
+        assert torch.equal(
+            baseline["fc1_tokens"][orders[0]], actual["fc1_tokens"][orders[1]]
+        )
+        logical_sf = [sf[order] for sf, order in zip(logical_sf, orders, strict=True)]
         assert torch.equal(*logical_sf)
         # Underflowed scales can produce different FP4 codes for zero values;
         # those blocks dequantize to zero in both paths.
-        expected = _nvfp4_dequant(baseline["fc2_tokens"], logical_sf[0])
-        result = _nvfp4_dequant(actual["fc2_tokens"], logical_sf[1])
+        expected = _nvfp4_dequant(baseline["fc2_tokens"][orders[0]], logical_sf[0])
+        result = _nvfp4_dequant(actual["fc2_tokens"][orders[1]], logical_sf[1])
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@supported_gpu
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (128, 2048, 768, 8)])
+def test_nvfp4_prefill_fused_quantization_preserves_bf16_intermediate(
+    geometry, monkeypatch
+):
+    profile = "absolute_output_wide" if geometry[0] == 64 else "output_wide"
+    test_nvfp4_fused_quantization_preserves_bf16_intermediate(
+        1024, "stg", profile, monkeypatch, geometry=geometry
+    )
 
 
 def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -3656,12 +3697,16 @@ def test_unqualified_input_profiles_are_excluded_from_normal_tuning():
 
     for tokens in (8192, 9216, 12288):
         args = ("nvfp4", tokens, 2048, 768, 128, 8, "swiglu")
-        assert prepared.profiles(*args) == (None,)
-        assert prepared.research_input_profiles(*args)
+        ordinary = prepared.profiles(*args)
+        research = prepared.research_input_profiles(*args)
+        assert None in ordinary
+        assert research and not set(ordinary).intersection(research)
 
 
 @supported_gpu
-@pytest.mark.parametrize("tokens", [8191, 8192, 8193, 12288])
+@pytest.mark.parametrize(
+    "tokens", [1023, 1024, 1025, 2047, 2048, 2049, 4096, 8191, 8192, 8193, 12288]
+)
 @pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (128, 2048, 768, 8)])
 @pytest.mark.parametrize("swizzled", [False, True])
 def test_nvfp4_prefill_routes_and_replay(tokens, geometry, swizzled, monkeypatch):

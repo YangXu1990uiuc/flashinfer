@@ -140,12 +140,17 @@ def profiles(dtype, tokens, hidden, intermediate, experts, topk, activation):
                 if tokens <= (512 if experts in (8, 12) else 128)
                 else (None, "static_general_plain_absolute")
             )
-        if primary and 8192 <= tokens <= 12288:
-            return (
+        if geometry == (64, 2048, 1408, 6) and 1024 <= tokens <= 12288:
+            base = (
                 (None, "absolute", "absolute_output_store")
-                if geometry == (64, 2048, 1408, 6)
-                else (None, "absolute")
+                if tokens >= 8192
+                else (None,)
             )
+            return base + ("absolute_output_wide",)
+        if geometry == (128, 2048, 768, 8) and 1024 <= tokens <= 12288:
+            return (None, "output_wide")
+        if primary and 8192 <= tokens <= 12288:
+            return (None, "absolute")
     return (None,)
 
 
@@ -173,6 +178,7 @@ def _source_identity():
             "nvfp4/reuse_source.py",
             "nvfp4/swap_fused_quant.py",
             "nvfp4/output_source.py",
+            "nvfp4/fc1_epilogue_source.py",
         )
     )
 
@@ -187,7 +193,9 @@ def plan_key(tag, first, second, profile):
 
 
 def load(kernel, device, profile):
-    if profile is None or (profile == "input_fusion" and not kernel.fc1):
+    if profile is None or (
+        profile in ("input_fusion", "output_wide") and not kernel.fc1
+    ):
         return common._load_kernel(kernel, device)
     from ...jit.env import FLASHINFER_GEN_SRC_DIR
 
@@ -206,6 +214,13 @@ def load(kernel, device, profile):
     path, digest = make_source(
         kernel, FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles", profile
     )
+    if "output_wide" in profile and kernel.fc1:
+        from .nvfp4.fc1_epilogue_source import make_source as epilogue_source
+
+        path, digest = epilogue_source(
+            SimpleNamespace(source_path=path),
+            FLASHINFER_GEN_SRC_DIR / "cudnn_frost_prepared_profiles",
+        )
     if "output_store" in profile and kernel.fc1:
         from .nvfp4.output_source import make_source as output_source
 
@@ -225,6 +240,15 @@ def load(kernel, device, profile):
 
 
 def valid_pair(first, second, profile):
+    if profile is not None and "output_wide" in profile:
+        return (
+            not first.swap_ab
+            and "output_scale" in first.launch_tail
+            and first.tactic_metadata.get("store_mode") == "stg"
+            and first.tactic_metadata.get("cta_group") == 2
+            and first.tactic_metadata.get("cta_tile", {}).get("m") == 128
+            and first.tactic_metadata.get("cta_tile", {}).get("n") == 256
+        )
     if profile is not None and "output_store" in profile:
         return (
             not first.swap_ab

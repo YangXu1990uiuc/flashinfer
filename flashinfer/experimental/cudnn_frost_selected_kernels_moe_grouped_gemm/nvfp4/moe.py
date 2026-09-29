@@ -43,7 +43,7 @@ _WEIGHT_KEYS = (
     "fc2_weight_block_scale",
     "fc2_dequant_scale",
 )
-_TAG = "cudnn_frost-nvfp4-moe-post5628-v5"
+_TAG = "cudnn_frost-nvfp4-moe-post5628-v6"
 
 
 def _tensor_version(tensor):
@@ -63,7 +63,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost NVFP4 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_nvfp4_moe_post5628_v5_{arch}",
+        f"cudnn_frost_nvfp4_moe_post5628_v6_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_nvfp4.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()

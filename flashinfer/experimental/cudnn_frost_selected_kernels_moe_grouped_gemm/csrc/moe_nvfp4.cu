@@ -1185,7 +1185,8 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
   bool use_tiled_input_gather() const {
     // Use the validated input path after physical row assignment.
     return !input_fused_ && s_ >= 8192 && t_ <= 32768 && (t_ <= 12288 || e_ == 12 || e_ == 64) &&
-           ((e_ == 64 && h_ == 2048 && i_ == 1408 && k_ == 6) ||
+           ((e_ == 128 && h_ == 2048 && i_ == 768 && k_ == 8) ||
+            (e_ == 64 && h_ == 2048 && i_ == 1408 && k_ == 6) ||
             (e_ == 12 && h_ == 7168 && i_ == 3072 && k_ == 2) ||
             (e_ == 8 && h_ == 4096 && i_ == 14336 && k_ == 2));
   }
