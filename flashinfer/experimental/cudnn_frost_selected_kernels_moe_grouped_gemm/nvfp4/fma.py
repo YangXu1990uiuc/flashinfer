@@ -19,13 +19,21 @@ _KERNELS = ("fma_fc1_o2.py", "fma_fc1_o4.py", "fma_fc2.py")
 
 def supported(tokens, hidden, intermediate, experts, topk, activation):
     """Small-token geometries with existing activation-specific TC shortlists."""
-    return activation in ACTIVATIONS and (
-        (
-            (experts, hidden, intermediate, topk) == (64, 2048, 1408, 6)
-            and 1 <= tokens <= 4
-        )
-        or (
-            (experts, hidden, intermediate, topk) == (12, 7168, 3072, 2) and tokens == 1
+    return (
+        activation == "swiglu"
+        and (experts, hidden, intermediate, topk) == (128, 2048, 768, 8)
+        and 1 <= tokens <= 4
+    ) or (
+        activation in ACTIVATIONS
+        and (
+            (
+                (experts, hidden, intermediate, topk) == (64, 2048, 1408, 6)
+                and 1 <= tokens <= 4
+            )
+            or (
+                (experts, hidden, intermediate, topk) == (12, 7168, 3072, 2)
+                and tokens == 1
+            )
         )
     )
 

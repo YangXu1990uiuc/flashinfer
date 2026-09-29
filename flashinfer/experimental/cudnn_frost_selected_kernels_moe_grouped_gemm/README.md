@@ -941,3 +941,21 @@ tactic cache identities use the rendered source digest, including geometry, so
 two configurations sharing a template cannot alias one specialization.
 Schema-v1 precompiled-object manifests are intentionally rejected; re-export
 research candidates with this source exporter before sweeping them.
+
+## Post-5628 review prototype
+
+The cumulative research branch is based on the merge of FlashInfer #5628.
+It preserves the merged numerical contracts, graph resource ownership and
+original execution candidates. Additional bounded strategies participate in
+full-pipeline autotuning and carry separate source/compiler-aware tactic keys.
+
+This review-only increment also admits SwiGLU NVFP4 E128/H2048/I768/K8 for
+1 through 12288 tokens, including both supported input scale layouts.
+`prepared_stage_inputs` rejects strategies that do not materialize grouped
+inputs. The experimental opt-in and existing compiler requirements still apply.
+This branch is a selective-adoption POC, not a merge-ready support expansion.
+
+The additional input strategies remain diagnostic-only while sanitizer findings
+are unresolved. They are excluded from normal tactic enumeration; targeted tests
+exercise them explicitly. Numerical success does not establish synchronization
+safety, and these research paths must be qualified before adoption.

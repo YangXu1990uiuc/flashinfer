@@ -20,9 +20,17 @@ def is_eligible(config, act, arch):
     ):
         return False
     try:
-        activation_name(config.activation)
+        name = activation_name(config.activation)
     except NotImplementedError:
         return False
+    geometry = (
+        config.routing.num_experts,
+        2 * x.shape[1],
+        config.experts.intermediate_size,
+        config.routing.top_k,
+    )
+    if name == "swiglu" and geometry == (128, 2048, 768, 8):
+        return 0 < act.num_tokens <= 12288
     return shortlisted_moe_geometry(config, act, hidden_size=2 * x.shape[1])
 
 

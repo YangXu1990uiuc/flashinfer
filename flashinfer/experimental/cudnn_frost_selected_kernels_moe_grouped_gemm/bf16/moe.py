@@ -29,7 +29,7 @@ from ..activations import ACTIVATIONS, activation_name
 from .support import large_bf16_moe
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
-_TAG = "cudnn_frost-bf16-moe-v2"
+_TAG = "cudnn_frost-bf16-moe-post5628-v1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -40,7 +40,7 @@ def _module(arch):
         raise ValueError("cuDNN Frost BF16 MoE kernels require SM107a")
 
     return gen_jit_spec(
-        f"cudnn_frost_bf16_moe_v2_{arch}",
+        f"cudnn_frost_bf16_moe_post5628_v1_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_bf16.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()

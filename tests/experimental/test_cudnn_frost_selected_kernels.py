@@ -1865,9 +1865,9 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     monkeypatch.setattr(
         moe,
         "_kernels",
-        lambda *args, **kwargs: ((), ())
-        if kwargs.get("quantized_output")
-        else (first, second),
+        lambda *args, **kwargs: (
+            ((), ()) if kwargs.get("quantized_output") else (first, second)
+        ),
     )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
     monkeypatch.setattr(moe, "_read", lambda roots: table)
@@ -2508,19 +2508,29 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
 
 @supported_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
-@pytest.mark.parametrize("store", ["stg", "tma"])
+@pytest.mark.parametrize(
+    "store,prepared_output",
+    [("stg", None), ("tma", None), ("stg", "output_store"), ("stg", "output_wide")],
+)
 def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
-    tokens, store, monkeypatch
+    tokens, store, prepared_output, monkeypatch, geometry=(8, 256, 256, 2)
 ):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
         moe,
     )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
 
+    if prepared_output:
+        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+            prepared,
+        )
+
+        monkeypatch.setattr(prepared, "profiles", lambda *args: (None, prepared_output))
+
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.manual_seed(131)
-    h, i, e, k = 256, 256, 8, 2
+    e, h, i, k = geometry
     activation = SwiGLU()
     quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
     config = replace(
@@ -2550,7 +2560,16 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         tokens * k, h, i, e, xq.device, activation, quantized_output=True
     )
     fused = next(
-        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+        kernel
+        for kernel in fused
+        if kernel.tactic_metadata["store_mode"] == store
+        and (
+            not (prepared_output and prepared_output.endswith("output_wide"))
+            or (
+                kernel.tactic_metadata.get("cta_group") == 2
+                and kernel.tactic_metadata["cta_tile"]["n"] == 256
+            )
+        )
     )
     original = next(
         kernel
@@ -2566,7 +2585,15 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    baseline_tactic = next(
+        t for t in tactics if t[1] == original.tactic and len(t) == 3
+    )
+    fused_tactic = next(
+        t
+        for t in tactics
+        if t[1] == fused.tactic
+        and ((prepared_output in t) if prepared_output else len(t) == 3)
+    )
     plans = inputs.launch_state.plans
     assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
         "workspace_size"
@@ -2605,12 +2632,43 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
                 unpacked[begin:end] = stage["fc2_token_scales"][index]
                 sf_start += (end - begin + 127) // 128 * 128
             logical_sf.append(unpacked)
+        # Physical grouped rows can be permuted independently between calls.
+        # Match input rows within each expert before comparing intermediates.
+        # Check the full input bytes so a prefix-key collision cannot hide a mismatch.
+        orders = []
+        starts = baseline["offsets"].tolist() + [rows]
+        for stage in (baseline, actual):
+            parts = []
+            for begin, end in zip(starts, starts[1:], strict=False):
+                key = (
+                    stage["fc1_tokens"][begin:end, :8]
+                    .contiguous()
+                    .view(torch.int64)
+                    .flatten()
+                )
+                parts.append(key.argsort(stable=True) + begin)
+            orders.append(torch.cat(parts))
+        assert torch.equal(
+            baseline["fc1_tokens"][orders[0]], actual["fc1_tokens"][orders[1]]
+        )
+        logical_sf = [sf[order] for sf, order in zip(logical_sf, orders, strict=True)]
         assert torch.equal(*logical_sf)
         # Underflowed scales can produce different FP4 codes for zero values;
         # those blocks dequantize to zero in both paths.
-        expected = _nvfp4_dequant(baseline["fc2_tokens"], logical_sf[0])
-        result = _nvfp4_dequant(actual["fc2_tokens"], logical_sf[1])
+        expected = _nvfp4_dequant(baseline["fc2_tokens"][orders[0]], logical_sf[0])
+        result = _nvfp4_dequant(actual["fc2_tokens"][orders[1]], logical_sf[1])
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@supported_gpu
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (128, 2048, 768, 8)])
+def test_nvfp4_prefill_fused_quantization_preserves_bf16_intermediate(
+    geometry, monkeypatch
+):
+    profile = "absolute_output_wide" if geometry[0] == 64 else "output_wide"
+    test_nvfp4_fused_quantization_preserves_bf16_intermediate(
+        1024, "stg", profile, monkeypatch, geometry=geometry
+    )
 
 
 def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -3406,3 +3464,252 @@ def test_frost_moe_declines_missing_graph_ownership(method, monkeypatch):
     monkeypatch.setattr(torch.cuda.CUDAGraph, method, None, raising=False)
     with pytest.raises(NotImplementedError, match=method):
         require_graph_resource_retention()
+
+
+@supported_gpu
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "mxfp8_mxfp4", "nvfp4"])
+@pytest.mark.parametrize("tokens", [1, 8, 128, 1536])
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (12, 7168, 3072, 2)])
+def test_model_geometry_native_routes(dtype, tokens, geometry, monkeypatch):
+    """Exercise physical tiny, ordinary, and large routing with every tactic."""
+    _assert_model_geometry_native_routes(dtype, tokens, geometry, monkeypatch)
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 4, 8, 256, 8192, 9216, 12288])
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_nvfp4_additional_model_geometry(tokens, swizzled, monkeypatch):
+    _assert_model_geometry_native_routes(
+        "nvfp4",
+        tokens,
+        (128, 2048, 768, 8),
+        monkeypatch,
+        swizzled=swizzled,
+        research_inputs=tokens >= 8192,
+    )
+
+
+def _assert_model_geometry_native_routes(
+    dtype, tokens, geometry, monkeypatch, swizzled=False, research_inputs=False
+):
+    from flashinfer import fused_moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        prepared,
+    )
+
+    if research_inputs:
+        ordinary = prepared.profiles
+        monkeypatch.setattr(
+            prepared,
+            "profiles",
+            lambda *args: ordinary(*args) + prepared.research_input_profiles(*args),
+        )
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
+    torch.manual_seed(5628 + tokens)
+    experts, hidden, intermediate, topk = geometry
+    moe = importlib.import_module(
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.moe"
+    )
+    suffix = {
+        "bf16": "Bf16",
+        "mxfp8": "Mxfp8",
+        "mxfp8_mxfp4": "Mxfp8Mxfp4",
+        "nvfp4": "Nvfp4",
+    }[dtype]
+    backend = getattr(fused_moe, f"Cutlass{suffix}Config")
+    q = fused_moe.QuantFormat
+    quant = {
+        "bf16": QuantConfig(),
+        "mxfp8": QuantConfig(q.MXFP8, q.MXFP8),
+        "mxfp8_mxfp4": QuantConfig(q.MXFP4, q.MXFP8),
+        "nvfp4": QuantConfig(q.NVFP4, q.NVFP4, swizzled_scale_factors=swizzled),
+    }[dtype]
+    config = replace(
+        bf16_config(topk=topk, experts=experts, intermediate=intermediate),
+        quant=quant,
+        backend=BackendOptions((backend(),)),
+        activation=SwiGLU(),
+    )
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    w1 = (
+        torch.randn(
+            experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02
+    )
+    w2 = (
+        torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16)
+        * 0.02
+    )
+    if dtype == "bf16":
+        xq, xsf = x, None
+        view = dict(fc1_expert_weights=w1, fc2_expert_weights=w2)
+    else:
+        xq, xsf = backend.prepare_activations(x, quant=quant)
+        if swizzled:
+            from flashinfer.quantization.fp4_quantization import (
+                nvfp4_block_scale_interleave,
+            )
+
+            xsf = nvfp4_block_scale_interleave(xsf.view(torch.uint8))
+        view = backend.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=SwiGLU(),
+        )
+    ids = torch.randint(
+        0, experts // 2, (tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    scores = torch.rand(tokens, topk, device="cuda").softmax(-1)
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({f"cutlass_{dtype}": view})
+    runner = getattr(moe, f"CudnnFrost{suffix}MoeRunner")(config, "cuda")
+    runner.check_support()
+    runner.build()
+    assert runner.accepts(act, weights)
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert len(tactics) >= 4
+    if research_inputs:
+        fused = [
+            tactic
+            for tactic in tactics
+            if "input_fusion" in tactic or "input_reuse" in tactic
+        ]
+        assert fused
+        if tokens >= 9216:
+            assert any("input_reuse" in tactic for tactic in fused)
+        assert all(
+            inputs.launch_state.plans[tactic]["input_fused_enabled"]()
+            for tactic in fused
+        )
+        for tactic in fused:
+            with pytest.raises(
+                Exception, match="do not materialize grouped stage inputs"
+            ):
+                moe.prepared_stage_inputs(inputs, tactic=tactic)
+    # Require actual FMA and Tensor Core plans where the bounded FMA route applies.
+    fma_tactic = moe._fma_tactic(tokens, hidden, intermediate, experts, topk, SwiGLU())
+    if tokens <= 4:
+        assert fma_tactic is not None and fma_tactic in tactics
+    else:
+        assert fma_tactic is None
+
+    def reference():
+        # Cover the beginning and tail without materializing a full reference prefill.
+        ix = torch.tensor(
+            sorted(set(range(min(tokens, 8))) | {tokens - 1}), device="cuda"
+        )
+        if swizzled:
+            row = ix[:, None]
+            col = torch.arange(hidden // 16, device="cuda")[None, :]
+            sf_index = (
+                (row // 128) * 128 * (hidden // 16)
+                + (col // 4) * 512
+                + (row % 32) * 16
+                + ((row % 128) // 32) * 4
+                + col % 4
+            )
+            sample_sf = (
+                xsf.view(torch.uint8).flatten()[sf_index].view(torch.float8_e4m3fn)
+            )
+        else:
+            sample_sf = xsf[ix] if xsf is not None else None
+        sample = MoEActivationPack(xq[ix], sample_sf, ids[ix], scores[ix])
+        if dtype == "bf16":
+            expected = _bf16_moe_reference(sample, weights)
+        elif dtype == "nvfp4":
+            expected = _nvfp4_moe_reference(sample, weights, SwiGLU())
+        else:
+            expected = _mxfp8_moe_reference(
+                sample, weights, SwiGLU(), mixed=dtype == "mxfp8_mxfp4"
+            )
+        return ix, expected
+
+    def check(out, ix, expected):
+        assert torch.isfinite(out).all()
+        actual = out[ix].float()
+        expected = expected.float()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.05, atol=0.01 * expected.abs().max().item()
+        )
+        assert (actual - expected).norm() / expected.norm().clamp_min(1e-12) < 0.02
+
+    ix, expected = reference()
+    graphs = []
+    for tactic in tactics:
+        out = runner.forward(inputs, tactic)
+        check(out, ix, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner.forward(list(inputs), tactic, launch_state=inputs.launch_state)
+        graphs.append(graph)
+    # Replay all captured physical paths with duplicate routes, empty experts,
+    # invalid routes, and changed scale bytes; no preparation may run in replay.
+    ids.fill_(experts - 1)
+    ids[::3, 0] = -1
+    ids[1::3, -1] = experts
+    scores.mul_(0.5)
+    if dtype == "bf16":
+        xq.neg_()
+    else:
+        xq.view(torch.uint8).bitwise_xor_(0x88 if dtype == "nvfp4" else 0x80)
+        xsf.view(torch.uint8).add_(1)
+    ix, expected = reference()
+    for graph in graphs:
+        inputs[0].fill_(float("nan"))
+        graph.replay()
+        check(inputs[0], ix, expected)
+    scores.zero_()
+    for graph in graphs:
+        graph.replay()
+        assert torch.count_nonzero(inputs[0]) == 0
+
+
+def test_prepared_profile_tactics_track_compiler_changes(monkeypatch):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+        prepared,
+    )
+
+    current = ["bundled"]
+    monkeypatch.setattr(compiler, "identity_key", lambda: current[0])
+    first, second = SimpleNamespace(tactic=("fc1",)), SimpleNamespace(tactic=("fc2",))
+    original = prepared.plan_key("tag", first, second, None)
+    before = prepared.plan_key("tag", first, second, "absolute")
+    current[0] = "different-assembler"
+    after = prepared.plan_key("tag", first, second, "absolute")
+    assert before != after
+    assert prepared.plan_key("tag", first, second, None) == original
+    current[0] = "bundled"
+    assert prepared.plan_key("tag", first, second, "absolute") == before
+
+
+def test_unqualified_input_profiles_are_excluded_from_normal_tuning():
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        prepared,
+    )
+
+    for tokens in (8192, 9216, 12288):
+        args = ("nvfp4", tokens, 2048, 768, 128, 8, "swiglu")
+        ordinary = prepared.profiles(*args)
+        research = prepared.research_input_profiles(*args)
+        assert None in ordinary
+        assert research and not set(ordinary).intersection(research)
+
+
+@supported_gpu
+@pytest.mark.parametrize(
+    "tokens", [1023, 1024, 1025, 2047, 2048, 2049, 4096, 8191, 8192, 8193, 12288]
+)
+@pytest.mark.parametrize("geometry", [(64, 2048, 1408, 6), (128, 2048, 768, 8)])
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_nvfp4_prefill_routes_and_replay(tokens, geometry, swizzled, monkeypatch):
+    _assert_model_geometry_native_routes(
+        "nvfp4", tokens, geometry, monkeypatch, swizzled=swizzled
+    )
