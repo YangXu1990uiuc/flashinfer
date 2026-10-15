@@ -115,6 +115,34 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
 
 
 @pytest.mark.arch_blackwell
+def test_mxfp8_staging_alternates_legacy_and_genphase_routing(monkeypatch):
+    """A compiled int64 stager cannot be reused for an int32 output ABI."""
+    import torch
+
+    _require_blackwell()
+    hidden, topk, capacity = 384, 3, 68
+    batch = _make_batch(65, hidden, topk, 16, seed=6447)
+    reference = _make_buffers("mxfp8_e4m3", capacity, hidden, topk)
+    _stage("mxfp8_e4m3", monkeypatch, False, batch, reference, None)
+    for input_dtype, output_dtype in (
+        (torch.int64, torch.int64),
+        (torch.int64, torch.int32),
+        (torch.int32, torch.int32),
+        (torch.int64, torch.int64),
+    ):
+        buffers = list(_make_buffers("mxfp8_e4m3", capacity, hidden, topk))
+        buffers[2] = buffers[2].to(output_dtype)
+        current = (batch[0], batch[1].to(input_dtype), batch[2])
+        _stage("mxfp8_e4m3", monkeypatch, True, current, buffers, None)
+        torch.cuda.synchronize()
+        for actual, expected in zip(buffers, reference, strict=True):
+            if actual.element_size() == 1:
+                assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+            else:
+                assert torch.equal(actual, expected.to(actual.dtype))
+
+
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("quant_type", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 @pytest.mark.parametrize("num_tokens", [32, 64])  # partial + full capacity
 def test_fused_stage_bit_matches_torch_stage(monkeypatch, quant_type, num_tokens):
