@@ -41,3 +41,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # GenPhase only: None selects N128/CGA4. N64 admits CGA2 or CGA4.
     mma_tiler_mnk: tuple[int, int, int] | None = None
     cluster_shape_mn: tuple[int, int] | None = None
+    # GenPhase only: None uses the bounded scheduling heuristic. An explicit
+    # ("grouped", None) preserves the kernel's original launch-cluster hint;
+    # ("grouped", positive_int) overrides it for offline tuning.
+    schedule_policy: tuple[str, int | None] | None = None

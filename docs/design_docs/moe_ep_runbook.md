@@ -649,6 +649,20 @@ selects N128/CGA4; N64 supports CGA2 or CGA4. Pipeline selection happens at
 construction and does not change with the live token count. GenPhase rejects
 legacy `knobs` (including online `"auto"`) and in-kernel FC2 reduction.
 
+`schedule_policy=None` uses a bounded host-side grouped-schedule heuristic:
+on SM103 with 148 SMs, EP2, H4096/I1024/E256/top-k8, capacity 1024 and no
+activation clamp, the group hint is four times the resident cluster count
+(148 for CGA4, 296 for CGA2). Other shapes and devices retain the kernel's
+original hint. Tile defaults remain N128/CGA4, and routing tensors are never
+read back for selection. This is a measured default, not an online autotuner
+or a guarantee of the globally fastest configuration.
+
+For offline tuning, set `schedule_policy=("grouped", positive_integer)` in
+`Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`. The explicit value takes
+precedence over the heuristic; `("grouped", None)` selects the original
+kernel behavior. The resolved policy is part of the workspace pool key.
+The low-level `Sm100GenphaseMoeConfig` retains its explicit policy semantics.
+
 `quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
 `False` accepts E4M3 activations and per-32 typed E8M0 scales in
 `MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with

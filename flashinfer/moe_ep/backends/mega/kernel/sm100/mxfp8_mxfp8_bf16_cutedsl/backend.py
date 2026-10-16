@@ -72,10 +72,29 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(
                     "Blackwell GenPhase requires separate reduction."
                 )
+            policy = config.schedule_policy
+            if policy is not None and (
+                not isinstance(policy, tuple)
+                or len(policy) != 2
+                or policy[0] != "grouped"
+                or (
+                    policy[1] is not None
+                    and (type(policy[1]) is not int or policy[1] <= 0)
+                )
+            ):
+                raise MoEEpConfigError(
+                    "GenPhase schedule_policy must be ('grouped', None) "
+                    "or ('grouped', a positive integer)."
+                )
             self.supports_live_token_tuning = False
-        elif config.mma_tiler_mnk is not None or config.cluster_shape_mn is not None:
+        elif (
+            config.mma_tiler_mnk is not None
+            or config.cluster_shape_mn is not None
+            or config.schedule_policy is not None
+        ):
             raise MoEEpConfigError(
-                "mma_tiler_mnk/cluster_shape_mn require kernel_variant='genphase'; "
+                "mma_tiler_mnk/cluster_shape_mn/schedule_policy require "
+                "kernel_variant='genphase'; "
                 "use knobs for the inference pipeline."
             )
         # knobs="auto": tune at the first compute() (weights + staged inputs
@@ -101,6 +120,30 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return mxfp8_cutedsl_runtime_requirements(bootstrap)
 
+    def _genphase_schedule_policy(self, fleet_params: FleetParams):
+        k = self._kernel_config
+        if k.schedule_policy is not None:
+            return k.schedule_policy
+        # Four resident-cluster waves lower latency in this measured region.
+        # Capacity is host metadata; never read live routes to select it.
+        if (
+            self.ep_world_size == 2
+            and fleet_params.num_experts == 256
+            and fleet_params.max_tokens_per_rank == 1024
+            and fleet_params.token_hidden_size == 4096
+            and k.intermediate_size == 1024
+            and k.top_k == 8
+            and k.kind == "mxfp8_e4m3"
+            and _resolve_gate_up_clamp(k) is None
+            and torch.cuda.is_available()
+        ):
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            if (props.major, props.minor, props.multi_processor_count) == (10, 3, 148):
+                cluster = k.cluster_shape_mn or (4, 1)
+                if cluster in ((2, 1), (4, 1)):
+                    return ("grouped", 4 * (props.multi_processor_count // cluster[0]))
+        return ("grouped", None)
+
     def _genphase_config(self, fleet_params: FleetParams):
         from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
 
@@ -124,6 +167,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 world_size=self.ep_world_size,
                 quant_kind=k.kind,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
+                schedule_policy=self._genphase_schedule_policy(fleet_params),
                 **geometry,
             )
         except (TypeError, ValueError) as exc:
